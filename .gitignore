@@ -1,0 +1,8 @@
+node_modules/
+data/
+
+# Claves y accesos: nunca al repositorio
+config.js
+.secret
+.env
+*.log
