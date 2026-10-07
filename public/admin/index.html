@@ -1,0 +1,256 @@
+<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>BioPanel · Administración</title>
+<link rel="stylesheet" href="/comun/panel.css">
+</head>
+<body data-panel="admin">
+
+<!-- LOGIN -->
+<section id="login" class="hidden">
+  <form class="login-card" id="loginForm">
+    <div class="brand"><span class="brand-mark"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="9" r="4"/><path d="M4 21c1.5-4 4.5-6 8-6s6.5 2 8 6"/></svg></span>BioPanel</div>
+    <p class="hint" style="margin:6px 0 20px">Administración de la plataforma</p>
+    <div style="display:flex;flex-direction:column;gap:12px">
+      <label class="f">Correo<input name="email" type="email" required autocomplete="username"></label>
+      <label class="f">Contraseña<input name="password" type="password" required autocomplete="current-password"></label>
+      <button class="btn primary" style="padding:10px">Entrar</button>
+      <div id="loginErr" class="hint" style="color:var(--danger)"></div>
+    </div>
+  </form>
+</section>
+
+<!-- APP -->
+<div id="app" class="hidden">
+  <aside id="side">
+    <div class="brand"><span class="brand-mark"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="9" r="4"/><path d="M4 21c1.5-4 4.5-6 8-6s6.5 2 8 6"/></svg></span>BioPanel</div>
+    <nav id="nav"></nav>
+    <div class="side-foot">
+      <b id="meName"></b><span id="meEmpresa"></span><br>
+      <button onclick="cambiarClave()">Cambiar clave</button><button onclick="logout()">Salir</button>
+    </div>
+  </aside>
+  <main>
+    <header class="top">
+      <button class="btn menu-btn" onclick="side.classList.toggle('open')">☰</button>
+      <h1 id="title"></h1>
+      <div class="scope">
+        <select id="scopeEmpresa" class="hidden" title="Empresa"></select>
+        <select id="scopeSucursal" title="Sucursal"></select>
+      </div>
+    </header>
+    <div id="aviso" class="alert hidden" style="background:var(--danger-soft);color:var(--danger)">
+      <b>El servidor está funcionando con una versión anterior del programa.</b> Reinícialo antes de editar empleados:
+      en la terminal donde corre, pulsa Ctrl+C, ejecuta <code>node server.js</code> y recarga esta página.</div>
+    <div id="view"></div>
+  </main>
+</div>
+<div id="modalRoot"></div>
+<div id="toast" class="hidden"></div>
+
+<script src="/comun/panel.js"></script>
+<script>
+/* Panel de la plataforma: empresas, relojes (con su parte técnica) y accesos de todas las empresas */
+function menu() {
+  return [['resumen','Resumen'], ['empresas','Empresas'], ['sucursales','Sucursales'], ['dispositivos','Dispositivos'],
+    ['empleados','Empleados'], ['horarios','Horarios'], ['marcaciones','Marcaciones'], ['reportes','Reportes', MENU_REPORTES], ['usuarios','Accesos al sistema']];
+}
+
+VIEWS.empresas = { title: 'Empresas', async render() {
+  empresas = await api('/empresas');
+  $('#view').innerHTML = `<div class="card"><div class="card-h"><h2>${empresas.length} empresas</h2><button class="btn primary" onclick="formEmpresa()">+ Nueva empresa</button></div>
+    <div class="table-wrap"><table><thead><tr><th>Empresa</th><th>NIT</th><th class="num">Sucursales</th><th class="num">Dispositivos</th><th class="num">Empleados</th><th></th></tr></thead><tbody>
+    ${empresas.map(e => `<tr><td><b>${esc(e.nombre)}</b></td><td>${esc(e.nit)}</td><td class="num">${e.sucursales}</td><td class="num">${e.dispositivos}</td><td class="num">${e.empleados}</td>
+      <td><div class="actions"><button class="btn sm" onclick="formEmpresa(${e.id})">Editar</button><button class="btn sm danger" onclick="borrarEmpresa(${e.id})">Eliminar</button></div></td></tr>`).join('') || '<tr><td colspan="6" class="empty">Crea tu primera empresa</td></tr>'}
+    </tbody></table></div></div>`;
+}};
+function formEmpresa(id) {
+  const e = empresas.find(x => x.id === id) || {};
+  modal({ title: id ? 'Editar empresa' : 'Nueva empresa', body: `
+    <label class="f">Nombre<input name="nombre" required value="${esc(e.nombre)}"></label>
+    <label class="f">NIT<input name="nit" value="${esc(e.nit)}"></label>
+    ${id ? '' : `<p class="hint" style="margin:4px 0 0">Se crea automáticamente la sucursal "Principal". Opcional: acceso para la empresa.</p>
+    <div class="grid2"><label class="f">Correo de acceso<input name="email" type="email"></label><label class="f">Contraseña<input name="password" type="text" minlength="6"></label></div>`}`,
+    async onSave(f) {
+      const d = fd(f);
+      if (id) await api('/empresas/' + id, { method: 'PUT', body: d });
+      else {
+        const nueva = await api('/empresas', { method: 'POST', body: d });
+        if (d.email) await api('/usuarios-sistema', { method: 'POST', body: { email: d.email, password: d.password, nombre: d.nombre, rol: 'empresa', empresa_id: nueva.id } });
+      }
+      toast('Empresa guardada'); await cargarScope(); render();
+    } });
+}
+async function borrarEmpresa(id) {
+  const e = empresas.find(x => x.id === id);
+  if (!confirmar(`¿Eliminar "${e.nombre}" con todas sus sucursales, empleados y accesos? Los equipos quedarán sin asignar.`)) return;
+  await run(() => api('/empresas/' + id, { method: 'DELETE' }), 'Empresa eliminada'); await cargarScope(); render();
+}
+
+VIEWS.dispositivos = { title: 'Dispositivos', auto: true, async render() {
+  devsCache = await api('/dispositivos' + qs(scope()));
+  const sinAsignar = devsCache.filter(d => !d.empresa_id), asignados = devsCache.filter(d => d.empresa_id);
+  const fila = d => `<tr>
+    <td><span class="dot ${d.en_linea ? 'on' : ''}" title="${d.en_linea ? 'En línea' : 'Fuera de línea'}"></span></td>
+    <td><b>${esc(d.nombre)}</b><div class="sub num">SN ${esc(d.sn)}${d.ip ? ' · ' + esc(d.ip) : ''}</div></td>
+    <td>${tipoBadge(d.tipo)}</td>
+    <td>${d.empresa_id ? `${isAdmin() ? esc(d.empresa) + '<div class="sub">' : '<div>'}${esc(d.sucursal || '—')}</div>` : '<span class="badge warn">Sin asignar</span>'}</td>
+    <td class="num">${d.empleados}${d.cmd_pendientes > 0 ? ` <span class="badge warn" title="Comandos en cola">${d.cmd_pendientes} en cola</span>` : ''}</td>
+    <td>${hace(d.ultimo_contacto)}<div class="sub">${esc(d.firmware || '')}</div></td>
+    <td><div class="actions">${d.empresa_id ? `
+      <button class="btn sm" onclick="bandejaReloj(${d.id})" title="Ver los usuarios que existen en el equipo, descargarlos en Excel y agregarlos al panel">Usuarios del reloj${d.usuarios_nuevos > 0 ? ` <span class="badge warn">${d.usuarios_nuevos} nuevos</span>` : ''}</button>
+      <button class="btn sm" onclick="accionDev(${d.id},'traer-marcaciones')">Traer marcaciones</button>
+      <button class="btn sm" onclick="accionDev(${d.id},'reenviar')" title="Volver a enviar todos los empleados asignados">Reenviar</button>
+      <button class="btn sm" onclick="verComandos(${d.id})">Comandos</button>
+      <button class="btn sm" onclick="formDispositivo(${d.id})">Editar</button>` : `<button class="btn sm primary" onclick="formDispositivo(${d.id})">Asignar</button>`}
+      <button class="btn sm danger" onclick="borrarDispositivo(${d.id})">Eliminar</button></div></td></tr>`;
+  const head = '<thead><tr><th></th><th>Equipo</th><th>Tipo</th><th>Ubicación</th><th>Empleados</th><th>Último contacto</th><th></th></tr></thead>';
+  $('#view').innerHTML = `
+    ${sinAsignar.length ? `<div class="card" style="margin-bottom:18px"><div class="card-h"><h2>Equipos detectados sin asignar</h2><span class="hint">Se conectaron al servidor pero aún no pertenecen a una sucursal</span></div>
+      <div class="table-wrap"><table>${head}<tbody>${sinAsignar.map(fila).join('')}</tbody></table></div></div>` : ''}
+    <div class="card"><div class="card-h"><h2>${asignados.length} dispositivos</h2><button class="btn primary" onclick="formDispositivo()">+ Registrar dispositivo</button></div>
+      <div class="table-wrap"><table>${head}<tbody>${asignados.map(fila).join('') || '<tr><td colspan="7" class="empty">Registra un equipo con su número de serie</td></tr>'}</tbody></table></div></div>
+    <p class="hint">En el equipo: Comunicación → Servidor en la nube (ADMS) → IP de este servidor y puerto 8088, HTTPS desactivado.</p>`;
+}};
+function sucursalOptions(value) {
+  const grupos = {};
+  sucursales.forEach(s => (grupos[s.empresa] ||= []).push(s));
+  return Object.entries(grupos).map(([emp, ss]) => `<optgroup label="${esc(emp)}">${ss.map(s => `<option value="${s.id}" ${String(value) === String(s.id) ? 'selected' : ''}>${esc(s.nombre)}</option>`).join('')}</optgroup>`).join('');
+}
+async function formDispositivo(id) {
+  if (isAdmin() && scope().empresa_id) sucursales = await api('/sucursales'); // para asignar a cualquier empresa
+  const d = devsCache.find(x => x.id === id) || { tipo: 'biometrico' };
+  modal({ title: id ? (d.empresa_id ? 'Editar dispositivo' : 'Asignar dispositivo') : 'Registrar dispositivo', body: `
+    <label class="f">Número de serie (SN)<input name="sn" required value="${esc(d.sn)}" ${id ? 'readonly' : ''} placeholder="Ej: NYU7252200477" style="text-transform:uppercase"></label>
+    ${id ? '' : '<p class="hint" style="margin:-4px 0 0">Lo encuentras en el equipo: Menú → Info. del sistema → Info. del dispositivo, o en la etiqueta trasera.</p>'}
+    <label class="f">Nombre<input name="nombre" value="${esc(d.nombre && d.nombre !== d.sn ? d.nombre : '')}" placeholder="Ej: Ingreso principal"></label>
+    <div class="f" style="font-size:12.5px;color:var(--muted);display:flex;flex-direction:column;gap:4px">Tipo
+      <div class="seg"><label><input type="radio" name="tipo" value="biometrico" ${d.tipo !== 'acceso' ? 'checked' : ''}>Biométrico (asistencia)</label><label><input type="radio" name="tipo" value="acceso" ${d.tipo === 'acceso' ? 'checked' : ''}>Control de acceso</label></div></div>
+    <label class="f">Sucursal<select name="sucursal_id" required><option value="">Elegir…</option>${sucursalOptions(d.sucursal_id || scope().sucursal_id)}</select></label>`,
+    async onSave(f) {
+      const b = fd(f);
+      if (id) await api('/dispositivos/' + id, { method: 'PUT', body: b }); else await api('/dispositivos', { method: 'POST', body: b });
+      toast('Dispositivo guardado'); await cargarSucursales(); render();
+    } });
+}
+async function accionDev(id, accion) {
+  const msg = { 'traer-marcaciones': 'Solicitud enviada: el equipo enviará su historial de marcaciones', reenviar: 'Empleados en cola para reenviarse' }[accion];
+  await run(() => api(`/dispositivos/${id}/${accion}`, { method: 'POST' }), msg); render();
+}
+async function verComandos(id) {
+  const list = await run(() => api(`/dispositivos/${id}/comandos`));
+  const cls = { ok: 'ok', error: 'err', pendiente: 'warn', enviado: 'warn', espera: 'warn', cancelado: 'err' };
+  const corto = t => (t = t.replace(/\t/g, ' ')).length > 140 ? t.slice(0, 140) + '…' : t; // las plantillas son muy largas
+  modal({ title: 'Últimos comandos', wide: true, body: `<div class="table-wrap"><table><thead><tr><th>#</th><th>Comando</th><th>Estado</th><th>Creado</th></tr></thead><tbody>
+    ${list.map(c => `<tr><td class="num">${c.id}</td><td><code style="font-size:12px;word-break:break-all">${esc(corto(c.comando))}</code>${c.empleado ? `<div class="sub">${esc(c.empleado)}</div>` : ''}</td>
+      <td><span class="badge ${cls[c.estado] || ''}">${esc(c.estado)}${c.retorno != null ? ' (' + esc(c.retorno) + ')' : ''}</span></td><td>${hace(c.creado)}</td></tr>`).join('') || '<tr><td colspan="4" class="empty">Sin comandos</td></tr>'}
+    </tbody></table></div>` });
+}
+/* Bandeja: usuarios que ya existen en el reloj → revisar, descargar Excel y agregar al panel */
+const PRIVILEGIO = { 0: 'Usuario', 14: 'Administrador' };
+function bandejaReloj(id) {
+  const d = devsCache.find(x => x.id === id);
+  const desmarcados = new Set();
+  let datos = { usuarios: [] }, poll = null;
+  const form = modal({ title: `Usuarios en ${d.nombre}`, wide: true, saveText: 'Agregar seleccionados al panel', body: `
+    <div class="toolbar" style="margin:0"><span id="bEstado" class="hint grow"></span>
+      <button type="button" class="btn" id="bLeer">Leer del reloj</button>
+      <button type="button" class="btn" id="bExcel">Descargar Excel</button></div>
+    <div id="bTabla"></div>
+    <p class="hint" style="margin:0">Los usuarios agregados se crean como empleados ya sincronizados con este equipo (no se les reenvía nada). Luego puedes completar su CI, departamento y cargo en Empleados.</p>`,
+    async onSave() {
+      const pines = [...form.querySelectorAll('input[name=bpin]:checked')].map(c => c.value);
+      if (!pines.length) throw new Error('Selecciona al menos un usuario nuevo');
+      const r = await api(`/dispositivos/${id}/usuarios-reloj/agregar`, { method: 'POST', body: { pines } });
+      toast(`${r.agregados} empleado(s) agregado(s)${r.omitidos ? ` · ${r.omitidos} ya existían` : ''}`); render();
+    } });
+  const btnAgregar = form.querySelector('.btn.primary');
+  const contar = () => {
+    const n = form.querySelectorAll('input[name=bpin]:checked').length;
+    btnAgregar.textContent = n ? `Agregar ${n} al panel` : 'Agregar seleccionados al panel';
+    btnAgregar.disabled = !n;
+  };
+  const pintar = () => {
+    const l = datos.lectura, list = datos.usuarios, leyendo = l && ['pendiente', 'enviado'].includes(l.estado);
+    form.querySelector('#bEstado').textContent =
+      !l ? (list.length ? 'Estos son los usuarios que el reloj ha informado. Pulsa "Leer del reloj" para traerlos todos.' : 'Aún no se han leído los usuarios de este equipo.')
+      : l.estado === 'pendiente' ? (datos.en_linea ? 'Solicitud en cola: el equipo la recogerá en unos segundos…' : 'El equipo está fuera de línea: se leerá cuando se conecte.')
+      : l.estado === 'enviado' ? 'Leyendo usuarios del reloj…'
+      : l.estado === 'error' ? `El equipo rechazó la lectura (código ${l.retorno}).`
+      : `Última lectura ${hace(l.respondido)} · ${list.length} usuarios en el reloj`;
+    form.querySelector('#bExcel').disabled = !list.length;
+    const nuevos = list.filter(u => !u.empleado_id);
+    form.querySelector('#bTabla').innerHTML = list.length ? `<div class="bandeja"><table>
+      <thead><tr><th><input type="checkbox" id="bTodos" title="Seleccionar todos los nuevos" ${nuevos.length ? '' : 'disabled'} ${nuevos.length && nuevos.every(u => !desmarcados.has(u.pin)) ? 'checked' : ''}></th>
+        <th class="num">PIN</th><th>Nombre</th><th>Tarjeta</th><th>Privilegio</th><th>Clave</th><th>Biometría</th><th>Estado</th></tr></thead><tbody>
+      ${list.map(u => `<tr>
+        <td><input type="checkbox" name="bpin" value="${esc(u.pin)}" ${u.empleado_id ? 'disabled' : desmarcados.has(u.pin) ? '' : 'checked'}></td>
+        <td class="num"><b>${esc(u.pin)}</b></td>
+        <td>${u.nombre ? esc(u.nombre) : '<span class="hint">Sin nombre</span>'}</td>
+        <td class="num">${esc(u.tarjeta)}</td>
+        <td>${u.privilegio == 14 ? '<span class="badge acc">Administrador</span>' : esc(PRIVILEGIO[u.privilegio] || 'Nivel ' + u.privilegio)}</td>
+        <td class="num">${esc(u.password)}</td>
+        <td><div class="chips">${u.rostro ? '<span class="badge">Rostro</span>' : ''}${u.huella ? '<span class="badge">Huella</span>' : ''}${u.rostro || u.huella ? '' : '<span class="hint">—</span>'}</div></td>
+        <td>${u.empleado_id ? `<span class="badge ok">En el panel</span>${u.empleado !== u.nombre ? `<div class="sub">${esc(u.empleado)}</div>` : ''}` : '<span class="badge warn">Nuevo</span>'}</td></tr>`).join('')}
+      </tbody></table></div>` : `<div class="empty">${leyendo ? 'Esperando datos del reloj…' : 'Sin usuarios'}</div>`;
+    contar();
+  };
+  const cargar = async () => {
+    clearTimeout(poll);
+    if (!document.body.contains(form)) return; // se cerró la ventana
+    datos = await api(`/dispositivos/${id}/usuarios-reloj`);
+    pintar();
+    const l = datos.lectura; // sigue consultando mientras la lectura esté en curso (y unos segundos después)
+    if (l && (['pendiente', 'enviado'].includes(l.estado) || (l.estado === 'ok' && Date.now() - new Date(l.respondido) < 15000)))
+      poll = setTimeout(() => cargar().catch(() => {}), 3000);
+  };
+  const leer = async () => { await run(() => api(`/dispositivos/${id}/leer-usuarios`, { method: 'POST' })); await cargar(); };
+  form.querySelector('#bLeer').onclick = () => leer().catch(() => {});
+  form.querySelector('#bExcel').onclick = async () => {
+    const r = await fetch(`/api/dispositivos/${id}/usuarios-reloj?formato=xlsx`, { headers: { Authorization: 'Bearer ' + token } });
+    if (!r.ok) return toast('No se pudo exportar', true);
+    const a = document.createElement('a'); a.href = URL.createObjectURL(await r.blob());
+    a.download = `usuarios_${d.sn}.xlsx`; a.click();
+  };
+  form.querySelector('#bTabla').onchange = e => {
+    const t = e.target;
+    if (t.id === 'bTodos') form.querySelectorAll('input[name=bpin]:not(:disabled)').forEach(c => {
+      c.checked = t.checked; desmarcados[t.checked ? 'delete' : 'add'](c.value);
+    });
+    else if (t.name === 'bpin') desmarcados[t.checked ? 'delete' : 'add'](t.value);
+    contar();
+  };
+  // La primera vez que se abre, lee el reloj automáticamente
+  cargar().then(() => { if (!datos.lectura) return leer(); }, e => toast(e.message, true)).catch(() => {});
+}
+async function borrarDispositivo(id) {
+  if (!confirmar('¿Eliminar este dispositivo del panel? (No borra nada dentro del equipo)')) return;
+  await run(() => api('/dispositivos/' + id, { method: 'DELETE' }), 'Dispositivo eliminado'); render();
+}
+
+VIEWS.usuarios = { title: 'Accesos al sistema', async render() {
+  const list = await api('/usuarios-sistema');
+  $('#view').innerHTML = `<div class="card"><div class="card-h"><h2>${list.length} accesos</h2><button class="btn primary" onclick="formUsuario()">+ Nuevo acceso</button></div>
+    <div class="table-wrap"><table><thead><tr><th>Correo</th><th>Nombre</th><th>Rol / perfil</th><th>Empresa</th><th></th></tr></thead><tbody>
+    ${list.map(u => `<tr><td><b>${esc(u.email)}</b></td><td>${esc(u.nombre)}</td><td>${u.rol === 'admin' ? '<span class="badge acc">Administrador de la plataforma</span>' : `<span class="badge">Empresa</span> ${perfilBadge(u.perfil)}`}</td><td>${esc(u.empresa || '—')}</td>
+      <td><div class="actions"><button class="btn sm" onclick="resetClave(${u.id})">Cambiar clave</button>${u.id !== me.id ? `<button class="btn sm danger" onclick="borrarUsuario(${u.id})">Eliminar</button>` : ''}</div></td></tr>`).join('')}
+    </tbody></table></div></div>
+    <p class="hint">Los accesos de empresa entran por <b>/clientes</b> y solo ven su empresa. Con perfil "Administrador" gestionan sus empleados y sus propios usuarios; con "Consulta" solo ven.</p>`;
+}};
+function formUsuario() {
+  const form = modal({ title: 'Nuevo acceso', body: `
+    <div class="grid2"><label class="f">Correo<input name="email" type="email" required></label><label class="f">Nombre<input name="nombre"></label></div>
+    <label class="f">Rol<select name="rol"><option value="empresa">Empresa (entra por /clientes y solo ve su empresa)</option><option value="admin">Administrador de la plataforma (entra por /admin)</option></select></label>
+    <div id="uEmp" style="display:flex;flex-direction:column;gap:12px">${empresaSelect('empresa_id', scope().empresa_id)}${perfilSelect()}</div>
+    <label class="f">Contraseña<input name="password" type="text" minlength="6" required></label>`,
+    async onSave(f) { await api('/usuarios-sistema', { method: 'POST', body: fd(f) }); toast('Acceso creado'); render(); } });
+  const rol = form.querySelector('[name=rol]'), emp = form.querySelector('[name=empresa_id]');
+  rol.onchange = () => { const a = rol.value === 'admin'; form.querySelector('#uEmp').classList.toggle('hidden', a); emp.required = !a; };
+}
+
+start();
+</script>
+</body>
+</html>

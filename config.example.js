@@ -6,9 +6,12 @@ module.exports = {
   TIMEZONE: -4,                 // Bolivia (UTC-4)
 
   // Administrador inicial (se crea solo la primera vez). Cambia la clave después de entrar.
-  ADMIN_EMAIL: 'admin@ejemplo.com',
-  ADMIN_PASSWORD: 'cambia-esta-clave',
+  ADMIN_EMAIL: '',
+  ADMIN_PASSWORD: '',
 
   // Segundos sin contacto para considerar un equipo "fuera de línea"
   ONLINE_SECONDS: 60,
+
+  // Contacto de soporte que ven los clientes en "Mi empresa" (opcional)
+  SOPORTE: { nombre: 'Soporte BioPanel', telefono: '+591 70000000', email: 'soporte@ejemplo.com' },
 };

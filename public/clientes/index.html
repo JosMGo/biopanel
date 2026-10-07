@@ -1,0 +1,106 @@
+<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>BioPanel · Clientes</title>
+<link rel="stylesheet" href="/comun/panel.css">
+</head>
+<body data-panel="clientes">
+
+<!-- LOGIN -->
+<section id="login" class="hidden">
+  <form class="login-card" id="loginForm">
+    <div class="brand"><span class="brand-mark"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="9" r="4"/><path d="M4 21c1.5-4 4.5-6 8-6s6.5 2 8 6"/></svg></span>BioPanel</div>
+    <p class="hint" style="margin:6px 0 20px">Asistencia de tu empresa</p>
+    <div style="display:flex;flex-direction:column;gap:12px">
+      <label class="f">Correo<input name="email" type="email" required autocomplete="username"></label>
+      <label class="f">Contraseña<input name="password" type="password" required autocomplete="current-password"></label>
+      <button class="btn primary" style="padding:10px">Entrar</button>
+      <div id="loginErr" class="hint" style="color:var(--danger)"></div>
+    </div>
+  </form>
+</section>
+
+<!-- APP -->
+<div id="app" class="hidden">
+  <aside id="side">
+    <div class="brand"><span class="brand-mark"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="9" r="4"/><path d="M4 21c1.5-4 4.5-6 8-6s6.5 2 8 6"/></svg></span>BioPanel</div>
+    <nav id="nav"></nav>
+    <div class="side-foot">
+      <b id="meName"></b><span id="meEmpresa"></span><br>
+      <button onclick="cambiarClave()">Cambiar clave</button><button onclick="logout()">Salir</button>
+    </div>
+  </aside>
+  <main>
+    <header class="top">
+      <button class="btn menu-btn" onclick="side.classList.toggle('open')">☰</button>
+      <h1 id="title"></h1>
+      <div class="scope">
+        <select id="scopeEmpresa" class="hidden" title="Empresa"></select>
+        <select id="scopeSucursal" title="Sucursal"></select>
+      </div>
+    </header>
+    <div id="view"></div>
+  </main>
+</div>
+<div id="modalRoot"></div>
+<div id="toast" class="hidden"></div>
+
+<script src="/comun/panel.js"></script>
+<script>
+/* Panel de la empresa cliente: ve su información y gestiona sus empleados y usuarios.
+   Sin funciones de plataforma: los relojes y las sucursales los administra BioPanel. */
+function menu() {
+  return [['resumen','Resumen'], ['sucursales','Sucursales'], ['empleados','Empleados'], ['horarios','Horarios'], ['marcaciones','Marcaciones'],
+    ['reportes','Reportes', MENU_REPORTES], ...(puedeEditar() ? [['usuarios','Usuarios']] : []), ['empresa','Mi empresa']];
+}
+
+VIEWS.usuarios = { title: 'Usuarios', async render() {
+  const list = await api('/usuarios-sistema'); // el servidor devuelve solo los de esta empresa
+  $('#view').innerHTML = `<div class="card"><div class="card-h"><h2>${list.length} usuarios</h2><button class="btn primary" onclick="formUsuario()">+ Nuevo usuario</button></div>
+    <div class="table-wrap"><table><thead><tr><th>Correo</th><th>Nombre</th><th>Perfil</th><th>Creado</th><th></th></tr></thead><tbody>
+    ${list.map(u => `<tr><td><b>${esc(u.email)}</b>${u.id === me.id ? ' <span class="hint">(tú)</span>' : ''}</td><td>${esc(u.nombre)}</td><td>${perfilBadge(u.perfil)}</td>
+      <td>${new Date(u.creado).toLocaleDateString('es-BO')}</td>
+      <td><div class="actions">${u.id !== me.id ? `<button class="btn sm" onclick="resetClave(${u.id})">Cambiar clave</button><button class="btn sm danger" onclick="borrarUsuario(${u.id})">Eliminar</button>` : ''}</div></td></tr>`).join('')}
+    </tbody></table></div></div>
+    <p class="hint">Las personas que agregues entran por este mismo link y solo ven ${esc(me.empresa)}. Con perfil "Consulta" ven todo, pero no pueden modificar empleados ni usuarios.</p>`;
+}};
+function formUsuario() {
+  modal({ title: 'Nuevo usuario', body: `
+    <div class="grid2"><label class="f">Correo<input name="email" type="email" required></label><label class="f">Nombre<input name="nombre"></label></div>
+    ${perfilSelect()}
+    <label class="f">Contraseña inicial<input name="password" type="text" minlength="6" required></label>
+    <p class="hint" style="margin:0">Compártela con la persona: puede cambiarla al entrar, en "Cambiar clave".</p>`,
+    async onSave(f) { await api('/usuarios-sistema', { method: 'POST', body: fd(f) }); toast('Usuario creado'); render(); } });
+}
+
+VIEWS.empresa = { title: 'Mi empresa', async render() {
+  const [e] = await api('/empresas'); // el servidor devuelve solo la del usuario
+  const s = me.soporte, fila = (k, v) => `<tr><td class="hint" style="width:130px">${k}</td><td>${v}</td></tr>`;
+  $('#view').innerHTML = `
+    <div class="tiles">
+      <div class="card tile"><div class="k">Sucursales</div><div class="v">${e.sucursales}</div></div>
+      <div class="card tile"><div class="k">Relojes</div><div class="v">${e.dispositivos}</div></div>
+      <div class="card tile"><div class="k">Empleados</div><div class="v">${e.empleados}</div></div>
+    </div>
+    <div class="two">
+      <div class="card"><div class="card-h"><h2>Datos de la empresa</h2></div><table><tbody>
+        ${fila('Nombre', `<b>${esc(e.nombre)}</b>`)}${fila('NIT', esc(e.nit) || '—')}${fila('Cliente desde', new Date(e.creado).toLocaleDateString('es-BO'))}
+      </tbody></table></div>
+      <div class="card"><div class="card-h"><h2>Mi cuenta</h2><button class="btn sm" onclick="cambiarClave()">Cambiar clave</button></div><table><tbody>
+        ${fila('Correo', esc(me.email))}${fila('Nombre', esc(me.nombre) || '—')}${fila('Perfil', perfilBadge(me.perfil))}
+      </tbody></table></div>
+    </div>
+    <div class="card" style="margin-top:18px"><div class="card-h"><h2>Soporte</h2></div><div style="padding:14px 16px">
+      ${s ? `<b>${esc(s.nombre)}</b>
+        ${s.telefono ? `<div>Teléfono: <a href="tel:${esc(s.telefono.replace(/\s/g, ''))}">${esc(s.telefono)}</a></div>` : ''}
+        ${s.email ? `<div>Correo: <a href="mailto:${esc(s.email)}">${esc(s.email)}</a></div>` : ''}` : ''}
+      <p class="hint" style="margin:${s ? '10px' : '0'} 0 0">Para registrar relojes nuevos, abrir o cambiar sucursales, o corregir los datos de la empresa, contacta a soporte.</p>
+    </div></div>`;
+}};
+
+start();
+</script>
+</body>
+</html>

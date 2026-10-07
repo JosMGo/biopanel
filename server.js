@@ -17,6 +17,7 @@ if (!fs.existsSync(SECRET_FILE)) fs.writeFileSync(SECRET_FILE, crypto.randomByte
 const SECRET = fs.readFileSync(SECRET_FILE, 'utf8').trim();
 
 // ---------------- Base de datos ----------------
+require('pg').types.setTypeParser(1082, v => v); // DATE como 'AAAA-MM-DD', sin pasar por zonas horarias
 const pool = new Pool({ connectionString: cfg.DATABASE_URL });
 const q = (text, params) => pool.query(text, params);
 const one = async (text, params) => (await q(text, params)).rows[0];
@@ -68,6 +69,45 @@ CREATE TABLE IF NOT EXISTS marcaciones (
   creado TIMESTAMPTZ DEFAULT now(), UNIQUE (sn, pin, fecha));
 ALTER TABLE comandos ADD COLUMN IF NOT EXISTS grupo TEXT;
 ALTER TABLE empleados ADD COLUMN IF NOT EXISTS pines_anteriores TEXT[] DEFAULT '{}';
+-- Fecha de ingreso: antes de ella no se cuentan faltas (vacía = la fecha en que se registró en el panel)
+ALTER TABLE empleados ADD COLUMN IF NOT EXISTS ingreso DATE;
+ALTER TABLE usuarios_sistema ADD COLUMN IF NOT EXISTS perfil TEXT NOT NULL DEFAULT 'administrador'
+  CHECK (perfil IN ('administrador','consulta'));
+-- Horarios: tolerancia en minutos; por cada día que se trabaja (0 = domingo … 6 = sábado), la entrada,
+-- la salida y la hora desde la que llegar cuenta como falta. Un día sin fila es libre.
+CREATE TABLE IF NOT EXISTS horarios (
+  id SERIAL PRIMARY KEY, empresa_id INT NOT NULL REFERENCES empresas(id) ON DELETE CASCADE,
+  nombre TEXT NOT NULL, tolerancia INT NOT NULL DEFAULT 0 CHECK (tolerancia BETWEEN 0 AND 240),
+  creado TIMESTAMPTZ DEFAULT now(), UNIQUE (empresa_id, nombre));
+CREATE TABLE IF NOT EXISTS horario_dias (
+  horario_id INT REFERENCES horarios(id) ON DELETE CASCADE, dia SMALLINT NOT NULL CHECK (dia BETWEEN 0 AND 6),
+  entrada TIME NOT NULL, salida TIME NOT NULL, limite_falta TIME NOT NULL,
+  PRIMARY KEY (horario_id, dia), CHECK (entrada < limite_falta AND limite_falta < salida));
+-- Horario principal de cada empresa desde una fecha: rige para todo su personal (NULL = sin horario desde esa fecha).
+-- Cambiarlo desde una fecha no altera los días anteriores.
+CREATE TABLE IF NOT EXISTS empresa_horario (
+  empresa_id INT REFERENCES empresas(id) ON DELETE CASCADE, desde DATE NOT NULL,
+  horario_id INT REFERENCES horarios(id), PRIMARY KEY (empresa_id, desde));
+-- Excepciones por empleado desde una fecha. modo: 'horario' (uno propio), 'sin_horario' (no se le controla)
+-- o 'empresa' (vuelve al horario de su empresa).
+CREATE TABLE IF NOT EXISTS empleado_horario (
+  empleado_id INT REFERENCES empleados(id) ON DELETE CASCADE, desde DATE NOT NULL,
+  horario_id INT REFERENCES horarios(id), PRIMARY KEY (empleado_id, desde));
+ALTER TABLE empleado_horario ADD COLUMN IF NOT EXISTS modo TEXT NOT NULL DEFAULT 'horario';
+UPDATE empleado_horario SET modo='sin_horario' WHERE modo='horario' AND horario_id IS NULL;
+-- Horario que rige para un empleado un día: su excepción si la tiene; si no, el de su empresa.
+-- (Los reportes hacen lo mismo en contextoHorarios, para muchos días a la vez.)
+CREATE OR REPLACE FUNCTION horario_vigente(p_empleado INT, p_dia DATE) RETURNS INT LANGUAGE sql STABLE AS $$
+  SELECT CASE WHEN ex.modo = 'horario' THEN ex.horario_id WHEN ex.modo = 'sin_horario' THEN NULL
+    ELSE (SELECT eh.horario_id FROM empresa_horario eh JOIN empleados e ON e.empresa_id = eh.empresa_id
+          WHERE e.id = p_empleado AND eh.desde <= p_dia ORDER BY eh.desde DESC LIMIT 1) END
+  FROM (SELECT 1) uno LEFT JOIN LATERAL (SELECT modo, horario_id FROM empleado_horario
+    WHERE empleado_id = p_empleado AND desde <= p_dia ORDER BY desde DESC LIMIT 1) ex ON TRUE
+$$;
+-- Feriados: empresa_id NULL = nacional (todas las empresas)
+CREATE TABLE IF NOT EXISTS feriados (
+  id SERIAL PRIMARY KEY, empresa_id INT REFERENCES empresas(id) ON DELETE CASCADE,
+  fecha DATE NOT NULL, nombre TEXT NOT NULL, UNIQUE NULLS NOT DISTINCT (empresa_id, fecha));
 CREATE INDEX IF NOT EXISTS idx_marc_fecha ON marcaciones(fecha);
 CREATE INDEX IF NOT EXISTS idx_cmd_pend ON comandos(dispositivo_id, estado);
 `;
@@ -150,46 +190,99 @@ function zip(files) {
   fin.writeUInt32LE(cd.length, 12); fin.writeUInt32LE(offset, 16);
   return Buffer.concat([...partes, cd, fin]);
 }
-// columnas: [[titulo, ancho], ...] (máx. 26); filas: arrays de valores. Todo se guarda como texto
-// para que Excel no quite ceros a la izquierda en PIN o tarjeta.
-function xlsx(hoja, columnas, filas) {
+// Libro con una o varias hojas: [{ nombre, columnas, filas, encabezado?, horizontal? }].
+// columnas: [[titulo, ancho, tipo?], ...] (máx. 26); filas: arrays de valores. El texto se guarda como texto
+// para que Excel no quite ceros a la izquierda en PIN o tarjeta; los números, como números. Tipos de columna:
+// 'horas' = minutos que se muestran como [h]:mm (Excel puede sumarlas); 'fecha' = 'AAAA-MM-DD' y 'hora' = 'HH:MM:SS',
+// que se guardan como fecha y hora de Excel para ordenar y filtrar bien.
+// encabezado: filas de texto sobre la tabla (la primera en negrita); horizontal: se imprime apaisada y a lo ancho.
+// Títulos de la tabla en azul oscuro con letra blanca y celdas con borde.
+function libroXlsx(hojas) {
   const x = v => String(v ?? '').replace(/[\x00-\x08\x0B\x0C\x0E-\x1F]/g, '')
     .replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
   const col = i => String.fromCharCode(65 + i);
-  const fila = (vals, r, s) => `<row r="${r}">` + vals.map((v, i) => v == null || v === '' ? '' :
-    `<c r="${col(i)}${r}" s="${s}" t="inlineStr"><is><t xml:space="preserve">${x(v)}</t></is></c>`).join('') + '</row>';
-  const ultima = col(columnas.length - 1), total = filas.length + 1;
+  // Estilos (cellXfs): 0 normal, 1 título de columna, 2 horas, 3 negrita, 4 dato con borde, 5 fecha, 6 hora
+  const ESTILO_TIPO = { horas: 2, fecha: 5, hora: 6 };
+  const numero = (v, tipo) => tipo === 'horas' ? v / 1440 :
+    tipo === 'fecha' ? Date.parse(v + 'T00:00:00Z') / 864e5 + 25569 :
+    tipo === 'hora' ? String(v).split(':').reduce((a, n) => a * 60 + Number(n), 0) / 86400 : v;
+  const celda = (v, ref, s, tipo) => {
+    if (s === 4) s = ESTILO_TIPO[tipo] || 4;
+    if (v == null || v === '') return s ? `<c r="${ref}" s="${s}"/>` : ''; // vacía, pero con su borde
+    const n = numero(v, tipo); // un texto en una columna de horas o fechas (p. ej. "Totales") queda como texto
+    if (typeof n === 'number' && Number.isFinite(n)) return `<c r="${ref}" s="${s}"><v>${n}</v></c>`;
+    return `<c r="${ref}" s="${s}" t="inlineStr"><is><t xml:space="preserve">${x(v)}</t></is></c>`;
+  };
+  const fila = (vals, r, s, tipos = [], attrs = '') =>
+    `<row r="${r}"${attrs}>` + vals.map((v, i) => celda(v, col(i) + r, s, tipos[i])).join('') + '</row>';
+  // Nombres de hoja: máx. 31 caracteres, sin \ / ? * [ ] : y sin repetirse
+  const usados = new Set();
+  const nombreHoja = n => {
+    const base = String(n).replace(/[\\/?*[\]:]/g, ' ').trim().slice(0, 31) || 'Hoja';
+    let s = base;
+    for (let i = 2; usados.has(s.toLowerCase()); i++) s = `${base.slice(0, 27)} (${i})`;
+    usados.add(s.toLowerCase());
+    return s;
+  };
+  const hs = hojas.map(h => {
+    const encabezado = h.encabezado || [], ini = encabezado.length ? encabezado.length + 2 : 1; // fila de títulos
+    return { ...h, nombre: nombreHoja(h.nombre), encabezado, ini, ultima: col(h.columnas.length - 1), fin: ini + h.filas.length };
+  });
   const NS = 'http://schemas.openxmlformats.org', XML = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>';
   const CT = 'application/vnd.openxmlformats-officedocument.spreadsheetml';
-  return zip({
+  const archivos = {
     '[Content_Types].xml': `${XML}<Types xmlns="${NS}/package/2006/content-types">` +
       `<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/>` +
-      `<Override PartName="/xl/workbook.xml" ContentType="${CT}.sheet.main+xml"/><Override PartName="/xl/worksheets/sheet1.xml" ContentType="${CT}.worksheet+xml"/>` +
+      `<Override PartName="/xl/workbook.xml" ContentType="${CT}.sheet.main+xml"/>` +
+      hs.map((_, i) => `<Override PartName="/xl/worksheets/sheet${i + 1}.xml" ContentType="${CT}.worksheet+xml"/>`).join('') +
       `<Override PartName="/xl/styles.xml" ContentType="${CT}.styles+xml"/></Types>`,
     '_rels/.rels': `${XML}<Relationships xmlns="${NS}/package/2006/relationships">` +
       `<Relationship Id="rId1" Type="${NS}/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/></Relationships>`,
     'xl/workbook.xml': `${XML}<workbook xmlns="${NS}/spreadsheetml/2006/main" xmlns:r="${NS}/officeDocument/2006/relationships">` +
-      `<sheets><sheet name="${x(hoja)}" sheetId="1" r:id="rId1"/></sheets>` +
-      `<definedNames><definedName name="_xlnm._FilterDatabase" localSheetId="0" hidden="1">'${x(hoja)}'!$A$1:$${ultima}$${total}</definedName></definedNames></workbook>`,
+      `<sheets>${hs.map((h, i) => `<sheet name="${x(h.nombre)}" sheetId="${i + 1}" r:id="rId${i + 1}"/>`).join('')}</sheets>` +
+      `<definedNames>${hs.map((h, i) => `<definedName name="_xlnm._FilterDatabase" localSheetId="${i}" hidden="1">` +
+        `'${x(h.nombre).replace(/'/g, "''")}'!$A$${h.ini}:$${h.ultima}$${h.fin}</definedName>`).join('')}</definedNames></workbook>`,
     'xl/_rels/workbook.xml.rels': `${XML}<Relationships xmlns="${NS}/package/2006/relationships">` +
-      `<Relationship Id="rId1" Type="${NS}/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/>` +
-      `<Relationship Id="rId2" Type="${NS}/officeDocument/2006/relationships/styles" Target="styles.xml"/></Relationships>`,
+      hs.map((_, i) => `<Relationship Id="rId${i + 1}" Type="${NS}/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet${i + 1}.xml"/>`).join('') +
+      `<Relationship Id="rId${hs.length + 1}" Type="${NS}/officeDocument/2006/relationships/styles" Target="styles.xml"/></Relationships>`,
     'xl/styles.xml': `${XML}<styleSheet xmlns="${NS}/spreadsheetml/2006/main">` +
-      `<fonts count="2"><font><sz val="11"/><name val="Calibri"/></font><font><b/><sz val="11"/><name val="Calibri"/></font></fonts>` +
+      `<numFmts count="3"><numFmt numFmtId="164" formatCode="[h]:mm"/><numFmt numFmtId="165" formatCode="dd/mm/yyyy"/>` +
+      `<numFmt numFmtId="166" formatCode="hh:mm:ss"/></numFmts>` +
+      `<fonts count="3"><font><sz val="11"/><name val="Calibri"/></font><font><b/><sz val="11"/><name val="Calibri"/></font>` +
+      `<font><b/><sz val="11"/><color rgb="FFFFFFFF"/><name val="Calibri"/></font></fonts>` +
       `<fills count="3"><fill><patternFill patternType="none"/></fill><fill><patternFill patternType="gray125"/></fill>` +
-      `<fill><patternFill patternType="solid"><fgColor rgb="FFE6F4F2"/><bgColor indexed="64"/></patternFill></fill></fills>` +
-      `<borders count="1"><border><left/><right/><top/><bottom/><diagonal/></border></borders>` +
+      `<fill><patternFill patternType="solid"><fgColor rgb="FF1F3864"/><bgColor indexed="64"/></patternFill></fill></fills>` +
+      `<borders count="2"><border><left/><right/><top/><bottom/><diagonal/></border><border>` +
+      ['left', 'right', 'top', 'bottom'].map(l => `<${l} style="thin"><color rgb="FFBFBFBF"/></${l}>`).join('') + '<diagonal/></border></borders>' +
       `<cellStyleXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellStyleXfs>` +
-      `<cellXfs count="2"><xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0"/>` +
-      `<xf numFmtId="0" fontId="1" fillId="2" borderId="0" xfId="0" applyFont="1" applyFill="1"/></cellXfs>` +
+      `<cellXfs count="7"><xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0"/>` +
+      `<xf numFmtId="0" fontId="2" fillId="2" borderId="1" xfId="0" applyFont="1" applyFill="1" applyBorder="1" applyAlignment="1">` +
+      `<alignment horizontal="center" vertical="center" wrapText="1"/></xf>` +
+      `<xf numFmtId="164" fontId="0" fillId="0" borderId="1" xfId="0" applyNumberFormat="1" applyBorder="1"/>` +
+      `<xf numFmtId="0" fontId="1" fillId="0" borderId="0" xfId="0" applyFont="1"/>` +
+      `<xf numFmtId="0" fontId="0" fillId="0" borderId="1" xfId="0" applyBorder="1"/>` +
+      `<xf numFmtId="165" fontId="0" fillId="0" borderId="1" xfId="0" applyNumberFormat="1" applyBorder="1"/>` +
+      `<xf numFmtId="166" fontId="0" fillId="0" borderId="1" xfId="0" applyNumberFormat="1" applyBorder="1"/></cellXfs>` +
       `<cellStyles count="1"><cellStyle name="Normal" xfId="0" builtinId="0"/></cellStyles></styleSheet>`,
-    'xl/worksheets/sheet1.xml': `${XML}<worksheet xmlns="${NS}/spreadsheetml/2006/main">` +
-      `<sheetViews><sheetView workbookViewId="0"><pane ySplit="1" topLeftCell="A2" activePane="bottomLeft" state="frozen"/></sheetView></sheetViews>` +
-      `<cols>${columnas.map(([, w], i) => `<col min="${i + 1}" max="${i + 1}" width="${w}" customWidth="1"/>`).join('')}</cols>` +
-      `<sheetData>${fila(columnas.map(c => c[0]), 1, 1)}${filas.map((f, i) => fila(f, i + 2, 0)).join('')}</sheetData>` +
-      `<autoFilter ref="A1:${ultima}${total}"/></worksheet>`,
+  };
+  hs.forEach((h, i) => {
+    archivos[`xl/worksheets/sheet${i + 1}.xml`] = `${XML}<worksheet xmlns="${NS}/spreadsheetml/2006/main">` +
+      (h.horizontal ? '<sheetPr><pageSetUpPr fitToPage="1"/></sheetPr>' : '') +
+      `<sheetViews><sheetView workbookViewId="0"><pane ySplit="${h.ini}" topLeftCell="A${h.ini + 1}" activePane="bottomLeft" state="frozen"/></sheetView></sheetViews>` +
+      `<cols>${h.columnas.map(([, w], k) => `<col min="${k + 1}" max="${k + 1}" width="${w}" customWidth="1"/>`).join('')}</cols>` +
+      `<sheetData>${h.encabezado.map((f, k) => fila(f, k + 1, k ? 0 : 3)).join('')}` +
+      fila(h.columnas.map(c => c[0]), h.ini, 1, [], ' ht="32" customHeight="1"') +
+      `${h.filas.map((f, k) => fila(f, h.ini + k + 1, 4, h.columnas.map(c => c[2]))).join('')}</sheetData>` +
+      `<autoFilter ref="A${h.ini}:${h.ultima}${h.fin}"/>` +
+      (h.horizontal ? '<pageSetup orientation="landscape" fitToWidth="1" fitToHeight="0"/>' : '') + '</worksheet>';
   });
+  return zip(archivos);
 }
+function enviarLibro(res, archivo, hojas) {
+  res.setHeader('Content-Disposition', `attachment; filename="${archivo.replace(/[^\w-]/g, '')}.xlsx"`);
+  res.type('application/vnd.openxmlformats-officedocument.spreadsheetml.sheet').send(libroXlsx(hojas));
+}
+const enviarXlsx = (res, archivo, hoja, columnas, filas) => enviarLibro(res, archivo, [{ nombre: hoja, columnas, filas }]);
 
 // ---------------- Utilidades ADMS ----------------
 const clean = s => String(s ?? '').replace(/[\t\r\n]/g, ' ').trim();
@@ -532,21 +625,30 @@ app.all('/iclock/{*resto}', (req, res) => res.type('text/plain').send('OK'));
 
 // ===== API del dashboard =====
 app.post('/api/login', async (req, res) => {
-  const { email, password } = req.body || {};
+  const { email, password, panel } = req.body || {};
   const u = await one(`SELECT * FROM usuarios_sistema WHERE lower(email)=lower($1)`, [email || '']);
   if (!u || !checkPass(password || '', u.hash)) throw new HttpError(401, 'Correo o contraseña incorrectos');
+  // Cada panel tiene su link: la plataforma entra por /admin y las empresas por /clientes
+  if (panel !== (u.rol === 'admin' ? 'admin' : 'clientes'))
+    throw new HttpError(403, u.rol === 'admin' ? 'Este acceso es de administrador: entra por /admin' : 'Este acceso es de cliente: entra por /clientes');
   const token = signToken({ id: u.id, rol: u.rol, empresa_id: u.empresa_id, exp: Date.now() + 12 * 3600e3 });
   res.json({ token });
 });
 
-app.use('/api', (req, res, next) => {
+app.use('/api', async (req, res, next) => {
   const t = verifyToken((req.headers.authorization || '').replace(/^Bearer\s+/i, ''));
   if (!t) throw new HttpError(401, 'Sesión expirada, vuelve a entrar');
-  req.user = t;
+  // Se lee el usuario en cada pedido: si lo eliminan o le cambian el perfil, se aplica al instante
+  req.user = await one(`SELECT id, rol, empresa_id, perfil FROM usuarios_sistema WHERE id=$1`, [t.id]);
+  if (!req.user) throw new HttpError(401, 'Sesión expirada, vuelve a entrar');
   next();
 });
 const isAdmin = req => req.user.rol === 'admin';
 const soloAdmin = (req) => { if (!isAdmin(req)) throw new HttpError(403, 'Solo el administrador'); };
+// Empleados y usuarios de la empresa: la plataforma o un usuario de la empresa con perfil "administrador"
+const soloEditor = req => {
+  if (!isAdmin(req) && req.user.perfil !== 'administrador') throw new HttpError(403, 'Tu perfil es de solo consulta');
+};
 // Empresa efectiva para filtros: admin puede elegir (o todas), empresa ve la suya
 const empresaScope = (req, pedida) => isAdmin(req) ? (pedida ? Number(pedida) : null) : req.user.empresa_id;
 const checkEmpresa = (req, empresa_id) => {
@@ -554,10 +656,11 @@ const checkEmpresa = (req, empresa_id) => {
 };
 
 app.get('/api/me', async (req, res) => {
-  const u = await one(`SELECT u.id,u.email,u.nombre,u.rol,u.empresa_id,e.nombre empresa
+  const u = await one(`SELECT u.id,u.email,u.nombre,u.rol,u.perfil,u.empresa_id,e.nombre empresa
     FROM usuarios_sistema u LEFT JOIN empresas e ON e.id=u.empresa_id WHERE u.id=$1`, [req.user.id]);
   // Si server.js o config.js cambiaron después de arrancar, el reloj sigue recibiendo órdenes del código viejo
-  u.desactualizado = ['server.js', 'config.js'].some(f => fs.statSync(path.join(__dirname, f)).mtimeMs > ARRANQUE);
+  if (isAdmin(req)) u.desactualizado = ['server.js', 'config.js'].some(f => fs.statSync(path.join(__dirname, f)).mtimeMs > ARRANQUE);
+  u.soporte = cfg.SOPORTE || null;
   res.json(u);
 });
 app.post('/api/me/password', async (req, res) => {
@@ -627,24 +730,25 @@ app.get('/api/sucursales', async (req, res) => {
     WHERE ($1::int IS NULL OR s.empresa_id=$1) ORDER BY e.nombre, s.nombre`, [emp]);
   res.json(rows);
 });
+// El cliente solo ve sus sucursales; crearlas y cambiarlas es de la plataforma
 app.post('/api/sucursales', async (req, res) => {
-  const empresa_id = isAdmin(req) ? req.body.empresa_id : req.user.empresa_id;
-  checkEmpresa(req, empresa_id);
+  soloAdmin(req);
+  const { empresa_id } = req.body;
   if (!empresa_id || !clean(req.body.nombre)) throw new HttpError(400, 'Empresa y nombre obligatorios');
   res.json(await one(`INSERT INTO sucursales (empresa_id,nombre,direccion) VALUES ($1,$2,$3) RETURNING *`,
     [empresa_id, clean(req.body.nombre), clean(req.body.direccion)]));
 });
 app.put('/api/sucursales/:id', async (req, res) => {
+  soloAdmin(req);
   const s = await one(`SELECT * FROM sucursales WHERE id=$1`, [req.params.id]);
   if (!s) throw new HttpError(404, 'No existe');
-  checkEmpresa(req, s.empresa_id);
   res.json(await one(`UPDATE sucursales SET nombre=$2, direccion=$3 WHERE id=$1 RETURNING *`,
     [s.id, clean(req.body.nombre), clean(req.body.direccion)]));
 });
 app.delete('/api/sucursales/:id', async (req, res) => {
+  soloAdmin(req);
   const s = await one(`SELECT * FROM sucursales WHERE id=$1`, [req.params.id]);
   if (!s) throw new HttpError(404, 'No existe');
-  checkEmpresa(req, s.empresa_id);
   const n = await one(`SELECT count(*)::int n FROM dispositivos WHERE sucursal_id=$1`, [s.id]);
   if (n.n) throw new HttpError(409, 'La sucursal tiene dispositivos; muévelos o elimínalos primero');
   await q(`DELETE FROM sucursales WHERE id=$1`, [s.id]);
@@ -659,6 +763,14 @@ const DEV_SELECT = `SELECT d.*, s.nombre sucursal, e.nombre empresa,
     (SELECT count(*) FROM usuarios_reloj u WHERE u.dispositivo_id=d.id
        AND NOT EXISTS (SELECT 1 FROM empleados x WHERE x.empresa_id=d.empresa_id AND x.pin=u.pin)) usuarios_nuevos
   FROM dispositivos d LEFT JOIN sucursales s ON s.id=d.sucursal_id LEFT JOIN empresas e ON e.id=d.empresa_id`;
+
+// Los relojes los administra solo la plataforma: el cliente únicamente obtiene la lista (sin datos técnicos),
+// que usa para el resumen, los filtros y para elegir en qué relojes va cada empleado
+const DEV_TECNICOS = ['sn', 'ip', 'firmware', 'info', 'cmd_pendientes', 'usuarios_nuevos'];
+app.use('/api/dispositivos', (req, res, next) => {
+  if (req.method !== 'GET' || req.path !== '/') soloAdmin(req);
+  next();
+});
 
 async function getDevice(req, id) {
   const d = await one(`SELECT * FROM dispositivos WHERE id=$1`, [id]);
@@ -675,6 +787,7 @@ app.get('/api/dispositivos', async (req, res) => {
     WHERE (($1::int IS NULL AND d.empresa_id IS NOT NULL) OR d.empresa_id=$1 OR ($3 AND d.empresa_id IS NULL))
       AND ($2::int IS NULL OR d.sucursal_id=$2)
     ORDER BY d.empresa_id NULLS FIRST, s.nombre, d.nombre`, [emp, suc, incluirSinAsignar]);
+  if (!isAdmin(req)) rows.forEach(d => DEV_TECNICOS.forEach(k => delete d[k]));
   res.json(rows);
 });
 
@@ -729,12 +842,10 @@ app.get('/api/dispositivos/:id/usuarios-reloj', async (req, res) => {
     WHERE u.dispositivo_id=$1 ORDER BY length(u.pin), u.pin`, [d.id, d.empresa_id]);
   if (req.query.formato === 'xlsx') {
     const si = v => v ? 'Sí' : 'No';
-    const file = xlsx('Usuarios',
+    return enviarXlsx(res, `usuarios_${d.sn}`, 'Usuarios',
       [['PIN', 10], ['Nombre', 30], ['Tarjeta', 14], ['Privilegio', 14], ['Clave', 10], ['Rostro', 9], ['Huella', 9], ['Estado en el panel', 34]],
       rows.map(u => [u.pin, u.nombre, u.tarjeta, PRIVILEGIO[u.privilegio] || `Nivel ${u.privilegio}`, u.password,
         si(u.rostro), si(u.huella), u.empleado_id ? `En el panel (${u.empleado})` : 'Nuevo']));
-    res.setHeader('Content-Disposition', `attachment; filename="usuarios_${d.sn.replace(/[^\w-]/g, '')}.xlsx"`);
-    return res.type('application/vnd.openxmlformats-officedocument.spreadsheetml.sheet').send(file);
   }
   const lectura = await one(`SELECT estado, retorno, creado, respondido FROM comandos
     WHERE dispositivo_id=$1 AND tipo='lectura' ORDER BY id DESC LIMIT 1`, [d.id]);
@@ -789,6 +900,9 @@ app.get('/api/empleados', async (req, res) => {
   const buscar = req.query.buscar ? `%${req.query.buscar}%` : null;
   const { rows } = await q(`
     SELECT e.*, x.nombre empresa,
+      (SELECT nombre FROM horarios WHERE id = horario_vigente(e.id, (now() AT TIME ZONE 'America/La_Paz')::date)) horario,
+      COALESCE((SELECT modo FROM empleado_horario WHERE empleado_id=e.id
+         AND desde <= (now() AT TIME ZONE 'America/La_Paz')::date ORDER BY desde DESC LIMIT 1) <> 'empresa', false) horario_propio,
       COALESCE((SELECT json_agg(json_build_object('id',d.id,'nombre',d.nombre,'sn',d.sn,'tipo',d.tipo,
           'sucursal',s.nombre,'estado',ed.estado,'rostro',ed.rostro,'huella',ed.huella) ORDER BY d.nombre)
         FROM empleado_dispositivo ed JOIN dispositivos d ON d.id=ed.dispositivo_id
@@ -800,6 +914,7 @@ app.get('/api/empleados', async (req, res) => {
       AND ($3::int IS NULL OR EXISTS (SELECT 1 FROM empleado_dispositivo ed WHERE ed.empleado_id=e.id AND ed.dispositivo_id=$3))
       AND ($4::text IS NULL OR e.nombre ILIKE $4 OR e.pin ILIKE $4 OR e.ci ILIKE $4)
     ORDER BY x.nombre, (CASE WHEN e.pin ~ '^[0-9]+$' THEN e.pin::bigint END), e.pin`, [emp, suc, dev, buscar]);
+  if (!isAdmin(req)) rows.forEach(e => e.dispositivos.forEach(d => delete d.sn));
   res.json(rows);
 });
 
@@ -869,22 +984,24 @@ function datosEmpleado(b) {
   if (!clean(b.nombre)) throw new HttpError(400, 'Nombre obligatorio');
   if (b.password && !/^\d{1,8}$/.test(clean(b.password))) throw new HttpError(400, 'La clave del reloj debe ser numérica (hasta 8 dígitos)');
   return [pin, clean(b.nombre), clean(b.ci), clean(b.telefono), clean(b.departamento), clean(b.cargo),
-    clean(b.tarjeta), clean(b.password), Number(b.privilegio) === 14 ? 14 : 0];
+    clean(b.tarjeta), clean(b.password), Number(b.privilegio) === 14 ? 14 : 0, b.ingreso ? fechaParam(b.ingreso, 'de ingreso') : null];
 }
 
 app.post('/api/empleados', async (req, res) => {
+  soloEditor(req);
   const empresa_id = isAdmin(req) ? Number(req.body.empresa_id) : req.user.empresa_id;
   if (!empresa_id) throw new HttpError(400, 'Elige la empresa');
   checkEmpresa(req, empresa_id);
   const datos = datosEmpleado(req.body);
   await validarPinLibre(datos[0], await validarDispositivos(empresa_id, req.body.dispositivos));
-  const e = await one(`INSERT INTO empleados (empresa_id,pin,nombre,ci,telefono,departamento,cargo,tarjeta,password,privilegio)
-    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING *`, [empresa_id, ...datos]);
+  const e = await one(`INSERT INTO empleados (empresa_id,pin,nombre,ci,telefono,departamento,cargo,tarjeta,password,privilegio,ingreso)
+    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) RETURNING *`, [empresa_id, ...datos]);
   await aplicarDispositivos(req, e, req.body.dispositivos, false);
   res.json(e);
 });
 
 app.put('/api/empleados/:id', async (req, res) => {
+  soloEditor(req);
   const prev = await one(`SELECT * FROM empleados WHERE id=$1`, [req.params.id]);
   if (!prev) throw new HttpError(404, 'No existe');
   checkEmpresa(req, prev.empresa_id);
@@ -896,7 +1013,7 @@ app.put('/api/empleados/:id', async (req, res) => {
     throw new HttpError(400, 'Para no mezclar cambios, cambia primero solo el PIN y guarda. Luego edita la tarjeta, clave o privilegio.');
   const plan = cambioPin ? await planCambioPin(prev, datos[0], ids) : [];
   // pines_anteriores: sus marcaciones con el PIN viejo siguen apareciendo a su nombre
-  const e = await one(`UPDATE empleados SET pin=$2,nombre=$3,ci=$4,telefono=$5,departamento=$6,cargo=$7,tarjeta=$8,password=$9,privilegio=$10,
+  const e = await one(`UPDATE empleados SET pin=$2,nombre=$3,ci=$4,telefono=$5,departamento=$6,cargo=$7,tarjeta=$8,password=$9,privilegio=$10,ingreso=$11,
       pines_anteriores = CASE WHEN pin <> $2 THEN array_append(array_remove(pines_anteriores, $2), pin) ELSE pines_anteriores END
     WHERE id=$1 RETURNING *`, [prev.id, ...datos]);
   if (cambioPin) {
@@ -911,6 +1028,7 @@ app.put('/api/empleados/:id', async (req, res) => {
 });
 
 app.delete('/api/empleados/:id', async (req, res) => {
+  soloEditor(req);
   const e = await one(`SELECT * FROM empleados WHERE id=$1`, [req.params.id]);
   if (!e) throw new HttpError(404, 'No existe');
   checkEmpresa(req, e.empresa_id);
@@ -946,45 +1064,605 @@ app.get('/api/marcaciones', async (req, res) => {
       AND ($4::date IS NULL OR m.fecha >= $4::date) AND ($5::date IS NULL OR m.fecha < $5::date + 1)
       AND ($6::text IS NULL OR e.nombre ILIKE $6 OR m.pin ILIKE $6)
     ORDER BY m.fecha DESC LIMIT $7`, p);
-  if (req.query.formato === 'csv') {
-    const cols = ['fecha', 'pin', 'empleado', 'departamento', 'cargo', 'empresa', 'sucursal', 'dispositivo', 'tipo', 'sn', 'verificacion'];
-    const esc = v => `"${String(v ?? '').replace(/"/g, '""')}"`;
-    const csv = '﻿' + cols.join(';') + '\n' + rows.map(r => cols.map(c => esc(r[c])).join(';')).join('\n');
-    res.setHeader('Content-Disposition', 'attachment; filename="marcaciones.csv"');
-    return res.type('text/csv').send(csv);
+  if (!isAdmin(req)) rows.forEach(r => delete r.sn);
+  res.json(rows); // el Excel de esta pantalla es el del reporte de marcaciones
+});
+
+// ---------------- Reportes de asistencia ----------------
+// Jornada = un empleado en un día. Entrada = 1.ª marcación; salida = la última. Con 4 o más marcaciones,
+// la 2.ª y la 3.ª son el almuerzo y se descuentan. Una marcación a menos de 2 min de la anterior es repetida.
+// La jornada se cuenta en la sucursal donde marcó la entrada.
+const REPETIDA_SEG = 120;
+const DIA_SEM = ['Domingo', 'Lunes', 'Martes', 'Miércoles', 'Jueves', 'Viernes', 'Sábado'];
+const numId = v => Number(v) || null;
+const fechaBO = d => d.split('-').reverse().join('/');
+const diaSem = d => DIA_SEM[new Date(d + 'T00:00:00Z').getUTCDay()];
+
+function fechaParam(v, nombre) {
+  const d = new Date(String(v) + 'T00:00:00Z'); // un mes 13 da fecha inválida; un 31/02 pasa a marzo: ambas se rechazan
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(v || '') || isNaN(d) || d.toISOString().slice(0, 10) !== v)
+    throw new HttpError(400, `La fecha ${nombre} no es válida`);
+  return v;
+}
+function rangoParam(query) {
+  const desde = fechaParam(query.desde, '"desde"'), hasta = fechaParam(query.hasta, '"hasta"');
+  const dias = (Date.parse(hasta) - Date.parse(desde)) / 864e5;
+  if (dias < 0) throw new HttpError(400, '"Desde" no puede ser posterior a "Hasta"');
+  if (dias > 366) throw new HttpError(400, 'El rango máximo es de un año');
+  return { desde, hasta };
+}
+
+const segHora = h => { const [a, b, c] = h.split(':').map(Number); return a * 3600 + b * 60 + c; };
+function calcularJornada(horas) {
+  const t = [];
+  for (const h of horas) if (!t.length || segHora(h) - segHora(t[t.length - 1]) >= REPETIDA_SEG) t.push(h);
+  const n = t.length, min = (a, b) => Math.round((segHora(b) - segHora(a)) / 60), hm = h => h.slice(0, 5);
+  const total = n < 2 ? null : min(t[0], t[n - 1]), descanso = n >= 4 ? min(t[1], t[2]) : null;
+  return {
+    entrada: hm(t[0]), salida: n > 1 ? hm(t[n - 1]) : null,
+    descanso_ini: n >= 4 ? hm(t[1]) : null, descanso_fin: n >= 4 ? hm(t[2]) : null, descanso,
+    almuerzo: n >= 4 ? `${hm(t[1])}–${hm(t[2])}` : null,
+    total, minutos: total == null ? null : total - (descanso || 0),
+  };
+}
+
+async function jornadas(emp, { desde, hasta, suc = null, empleado_id = null, pin = null }) {
+  const { rows } = await q(`
+    SELECT d.empresa_id, x.nombre empresa, e.id empleado_id, COALESCE(e.pin, m.pin) pin, e.nombre, e.ci, e.departamento, e.cargo, e.alta,
+      to_char(m.fecha, 'YYYY-MM-DD') dia,
+      (array_agg(d.sucursal_id ORDER BY m.fecha))[1] sucursal_id,
+      (array_agg(s.nombre ORDER BY m.fecha))[1] sucursal,
+      array_agg(to_char(m.fecha, 'HH24:MI:SS') ORDER BY m.fecha) horas
+    FROM marcaciones m
+    JOIN dispositivos d ON d.id=m.dispositivo_id
+    JOIN empresas x ON x.id=d.empresa_id
+    LEFT JOIN sucursales s ON s.id=d.sucursal_id
+    LEFT JOIN LATERAL (SELECT em.id, em.pin, em.nombre, em.ci, em.departamento, em.cargo,
+        COALESCE(em.ingreso, (em.creado AT TIME ZONE 'America/La_Paz')::date)::text alta FROM empleados em
+      WHERE em.empresa_id=d.empresa_id AND (em.pin=m.pin OR m.pin = ANY(em.pines_anteriores))
+      ORDER BY em.pin=m.pin DESC LIMIT 1) e ON TRUE
+    WHERE ($1::int IS NULL OR d.empresa_id=$1) AND m.fecha >= $2::date AND m.fecha < $3::date + 1
+      AND ($4::int IS NULL OR e.id=$4) AND ($5::text IS NULL OR (e.id IS NULL AND m.pin=$5))
+    GROUP BY d.empresa_id, x.nombre, e.id, COALESCE(e.pin, m.pin), e.nombre, e.ci, e.departamento, e.cargo, e.alta, to_char(m.fecha, 'YYYY-MM-DD')
+    ORDER BY dia`, [emp, desde, hasta, empleado_id, pin]);
+  return rows.filter(r => !suc || r.sucursal_id === suc).map(({ horas, ...r }) => ({
+    ...r, clave: r.empleado_id ? `e${r.empleado_id}` : `p${r.empresa_id}-${r.pin}`,
+    marcaciones: horas.length, ...calcularJornada(horas),
+  }));
+}
+
+// Empleados que se espera ver: los activos de la empresa y, si se filtra por sucursal, con equipos en ella
+async function esperados(emp, suc) {
+  const { rows } = await q(`
+    SELECT 'e' || e.id clave, e.id empleado_id, e.empresa_id, x.nombre empresa, e.pin, e.nombre, e.ci, e.departamento, e.cargo,
+      COALESCE(e.ingreso, (e.creado AT TIME ZONE 'America/La_Paz')::date)::text alta,
+      (SELECT string_agg(DISTINCT s.nombre, ', ') FROM empleado_dispositivo ed JOIN dispositivos d ON d.id=ed.dispositivo_id
+         JOIN sucursales s ON s.id=d.sucursal_id WHERE ed.empleado_id=e.id AND ed.estado<>'eliminando') sucursal
+    FROM empleados e JOIN empresas x ON x.id=e.empresa_id
+    WHERE e.activo AND ($1::int IS NULL OR e.empresa_id=$1)
+      AND ($2::int IS NULL OR EXISTS (SELECT 1 FROM empleado_dispositivo ed JOIN dispositivos d ON d.id=ed.dispositivo_id
+             WHERE ed.empleado_id=e.id AND ed.estado<>'eliminando' AND d.sucursal_id=$2))`, [emp, suc]);
+  return rows;
+}
+
+// Por empresa y nombre; los PIN no registrados en el panel, al final
+const porNombre = (a, b) => a.empresa.localeCompare(b.empresa) || !a.nombre - !b.nombre ||
+  (a.nombre || '').localeCompare(b.nombre || '') || a.pin.localeCompare(b.pin, undefined, { numeric: true });
+
+// ---------------- Asistencia contra el horario ----------------
+// Por día: retraso = minutos desde la hora de entrada, solo si pasa la tolerancia; llegar después del límite
+// (o no marcar en un día laboral) es 1 día de falta; salida anticipada = minutos antes de la salida del horario.
+// Los días libres, los feriados y lo que todavía no pasó (hoy antes del límite, días futuros) no cuentan falta.
+const aMinutos = h => Number(h.slice(0, 2)) * 60 + Number(h.slice(3, 5));
+const aHoras = m => `${Math.floor(m / 60)}:${String(m % 60).padStart(2, '0')}`;
+const ahoraBO = () => new Date().toLocaleString('sv-SE', { timeZone: 'America/La_Paz' }); // 'AAAA-MM-DD HH:MM:SS'
+
+async function contextoHorarios(emp, desde, hasta) {
+  const [{ rows: hs }, { rows: ex }, { rows: pr }, { rows: fs }] = await Promise.all([
+    q(`SELECT h.id, h.nombre, h.tolerancia, d.dia, to_char(d.entrada,'HH24:MI') entrada, to_char(d.salida,'HH24:MI') salida,
+         to_char(d.limite_falta,'HH24:MI') limite_falta
+       FROM horarios h LEFT JOIN horario_dias d ON d.horario_id=h.id WHERE ($1::int IS NULL OR h.empresa_id=$1)`, [emp]),
+    q(`SELECT eh.empleado_id clave, eh.desde::text desde, eh.horario_id, eh.modo FROM empleado_horario eh JOIN empleados e ON e.id=eh.empleado_id
+       WHERE ($1::int IS NULL OR e.empresa_id=$1) AND eh.desde <= $2::date ORDER BY eh.empleado_id, eh.desde`, [emp, hasta]),
+    q(`SELECT empresa_id clave, desde::text desde, horario_id FROM empresa_horario
+       WHERE ($1::int IS NULL OR empresa_id=$1) AND desde <= $2::date ORDER BY empresa_id, desde`, [emp, hasta]),
+    q(`SELECT fecha::text fecha, nombre, empresa_id FROM feriados
+       WHERE fecha BETWEEN $2::date AND $3::date AND ($1::int IS NULL OR empresa_id IS NULL OR empresa_id=$1)`, [emp, desde, hasta]),
+  ]);
+  const horarios = new Map();
+  for (const r of hs) {
+    if (!horarios.has(r.id)) horarios.set(r.id, { id: r.id, nombre: r.nombre, tolerancia: r.tolerancia, turnos: {} });
+    if (r.dia != null) horarios.get(r.id).turnos[r.dia] = { entrada: r.entrada, salida: r.salida, limite_falta: r.limite_falta };
   }
+  const agrupar = filas => {
+    const m = new Map();
+    for (const f of filas) { if (!m.has(f.clave)) m.set(f.clave, []); m.get(f.clave).push(f); }
+    return m;
+  };
+  const excepciones = agrupar(ex), principales = agrupar(pr);
+  const vigente = (lista, dia) => { let a = null; for (const x of lista || []) if (x.desde <= dia) a = x; else break; return a; };
+  const feriados = new Map(fs.map(f => [`${f.empresa_id ?? ''}|${f.fecha}`, f.nombre]));
+  return {
+    // { horario, turno, origen } de un empleado ese día: su excepción si la tiene, si no el principal de su empresa.
+    // horario null = sin horario; turno null = día libre. Los PIN que no están en el panel no tienen horario.
+    de(empleado_id, empresa_id, dia) {
+      if (!empleado_id) return { horario: null, turno: null, origen: 'empresa' };
+      const propio = vigente(excepciones.get(empleado_id), dia);
+      let horario_id, origen = 'empresa';
+      if (propio && propio.modo !== 'empresa') { origen = 'propio'; horario_id = propio.modo === 'horario' ? propio.horario_id : null; }
+      else horario_id = vigente(principales.get(empresa_id), dia)?.horario_id;
+      const horario = horario_id ? horarios.get(horario_id) : null;
+      return { horario, origen, turno: horario?.turnos[new Date(dia + 'T00:00:00Z').getUTCDay()] || null };
+    },
+    feriado: (empresa_id, dia) => feriados.get(`${empresa_id}|${dia}`) || feriados.get(`|${dia}`) || null,
+  };
+}
+
+const ESTADO_DIA = { presente: 'Presente', retraso: 'Retraso', anticipada: 'Salida anticipada', sin_salida: 'Sin salida',
+  falta: 'Falta', libre: 'Libre', feriado: 'Feriado', sin_horario: 'Sin horario', pendiente: 'Pendiente', antes_alta: 'Antes del ingreso' };
+
+function evaluarDia(dia, j, { horario, turno, origen }, feriado, ahora, alta) {
+  const r = { horario: horario?.nombre || '', h_entrada: turno?.entrada || null, h_salida: turno?.salida || null,
+    h_minutos: turno ? aMinutos(turno.salida) - aMinutos(turno.entrada) : null, laboral: 0, retraso: 0, anticipada: 0, falta: 0 };
+  const sinSalida = j && !j.salida;
+  if (feriado) return { ...r, estado: 'feriado', obs: `Feriado: ${feriado}` };
+  if (!horario) return { ...r, estado: !j ? 'sin_horario' : sinSalida ? 'sin_salida' : 'presente',
+    obs: !j ? (origen === 'propio' ? 'Sin control de horario' : 'Sin horario asignado') : sinSalida ? 'Sin salida' : '' };
+  if (!turno) return { ...r, estado: 'libre', obs: j ? 'Día libre (marcó)' : 'Día libre' };
+  const hoy = ahora.slice(0, 10), hora = ahora.slice(11, 16);
+  if (!j && (dia > hoy || (dia === hoy && hora <= turno.limite_falta))) return { ...r, estado: 'pendiente', obs: '' };
+  if (!j && alta && dia < alta) return { ...r, estado: 'antes_alta', obs: `Antes de su ingreso (${fechaBO(alta)})` };
+  r.laboral = 1;
+  if (!j) return { ...r, falta: 1, estado: 'falta', obs: 'No marcó' };
+  if (j.entrada > turno.limite_falta) return { ...r, falta: 1, estado: 'falta', obs: `Llegó ${j.entrada}, después del límite de las ${turno.limite_falta}` };
+  const tarde = aMinutos(j.entrada) - aMinutos(turno.entrada);
+  if (tarde > horario.tolerancia) r.retraso = tarde;
+  if (j.salida) r.anticipada = Math.max(0, aMinutos(turno.salida) - aMinutos(j.salida));
+  const obs = [r.retraso ? `Retraso ${aHoras(r.retraso)}` : '', sinSalida ? 'Sin salida' : r.anticipada ? `Salió ${aHoras(r.anticipada)} antes` : '']
+    .filter(Boolean).join(' · ');
+  return { ...r, estado: r.retraso ? 'retraso' : sinSalida ? 'sin_salida' : r.anticipada ? 'anticipada' : 'presente', obs };
+}
+
+function totalizar(dias) {
+  const t = { laborables: 0, dias: 0, marcaciones: 0, total: 0, descanso: 0, minutos: 0, sin_salida: 0,
+    retrasos: 0, retraso: 0, anticipadas: 0, anticipada: 0, faltas: 0 };
+  for (const d of dias) {
+    t.laborables += d.laboral; t.faltas += d.falta;
+    if (d.retraso) { t.retrasos++; t.retraso += d.retraso; }
+    if (d.anticipada) { t.anticipadas++; t.anticipada += d.anticipada; }
+    if (!d.marcaciones) continue;
+    t.dias++; t.marcaciones += d.marcaciones; t.descanso += d.descanso || 0;
+    if (d.minutos == null) t.sin_salida++; else { t.minutos += d.minutos; t.total += d.total; }
+  }
+  return t;
+}
+
+// Una hoja por persona con todos los días del rango. personas: los esperados; los PIN que marcaron sin estar
+// en el panel se agregan desde las jornadas.
+function armarHojas(personas, js, ctx, desde, hasta, incluir = () => true) {
+  const ahora = ahoraBO(), fechas = [];
+  for (let t = Date.parse(desde); t <= Date.parse(hasta); t += 864e5) fechas.push(new Date(t).toISOString().slice(0, 10));
+  const porClave = new Map(personas.map(p => [p.clave, { ...p, jornadas: new Map() }]));
+  for (const j of js) {
+    if (!porClave.has(j.clave)) porClave.set(j.clave, { clave: j.clave, empleado_id: j.empleado_id, empresa_id: j.empresa_id, empresa: j.empresa,
+      pin: j.pin, nombre: j.nombre, ci: j.ci, departamento: j.departamento, cargo: j.cargo, alta: j.alta, jornadas: new Map() });
+    porClave.get(j.clave).jornadas.set(j.dia, j);
+  }
+  return [...porClave.values()].filter(incluir).sort(porNombre).map(({ jornadas, ...p }) => {
+    const dias = fechas.map(dia => {
+      const j = jornadas.get(dia);
+      const marcado = j ? { entrada: j.entrada, salida: j.salida, descanso_ini: j.descanso_ini, descanso_fin: j.descanso_fin, almuerzo: j.almuerzo,
+        descanso: j.descanso, total: j.total, minutos: j.minutos, marcaciones: j.marcaciones, sucursal: j.sucursal } : { marcaciones: 0 };
+      return { dia, ...marcado, ...evaluarDia(dia, j, ctx.de(p.empleado_id, p.empresa_id, dia), ctx.feriado(p.empresa_id, dia), ahora, p.alta) };
+    });
+    const actual = ctx.de(p.empleado_id, p.empresa_id, hasta);
+    return { ...p, horario: actual.horario?.nombre || '', horario_propio: actual.origen === 'propio', dias, totales: totalizar(dias) };
+  });
+}
+
+// Personal filtrado: sucursal (selector de arriba), nombre/PIN/CI y departamento
+async function hojasFiltradas(req, desde, hasta) {
+  const emp = empresaScope(req, req.query.empresa_id), suc = numId(req.query.sucursal_id);
+  const buscar = clean(req.query.buscar).toLowerCase(), dep = clean(req.query.departamento);
+  const [personas, js, ctx] = await Promise.all([esperados(emp, suc), jornadas(emp, { desde, hasta, suc }), contextoHorarios(emp, desde, hasta)]);
+  const incluir = p => (!buscar || [p.nombre, p.pin, p.ci].some(v => String(v || '').toLowerCase().includes(buscar))) && (!dep || p.departamento === dep);
+  const departamentos = [...new Set(personas.map(p => p.departamento).filter(Boolean))].sort();
+  return { hojas: armarHojas(personas, js, ctx, desde, hasta, incluir), departamentos };
+}
+
+// Hoja de asistencia en Excel, con las columnas de la hoja impresa
+const COLS_HOJA = [['Fecha', 11], ['Día', 10], ['Horario', 16], ['Entrada horario', 9], ['Salida horario', 9], ['Horas laborales', 9, 'horas'],
+  ['Día laboral', 8], ['Entrada', 9], ['Salida', 9], ['Salida descanso', 9], ['Entrada descanso', 9], ['Horas descanso', 9, 'horas'],
+  ['Total horas', 9, 'horas'], ['Horas trabajadas', 10, 'horas'], ['Retraso', 9, 'horas'], ['Salida anticipada', 10, 'horas'], ['Falta', 7],
+  ['Observación', 34]];
+function hojaExcel(h, desde, hasta) {
+  const t = h.totales;
+  return {
+    nombre: `${h.pin} ${h.nombre || 'No registrado'}`, horizontal: true, columnas: COLS_HOJA,
+    encabezado: [[`Hoja de asistencia · ${h.empresa}`], [`Fecha inicial ${fechaBO(desde)}    Fecha final ${fechaBO(hasta)}`],
+      [`ID del empleado: ${h.pin}    Nombres: ${h.nombre || 'No registrado'}    CI: ${h.ci || '—'}    Departamento: ${h.departamento || '—'}` +
+        `    Cargo: ${h.cargo || '—'}    Horario: ${h.horario || 'Sin horario'}${h.horario_propio ? ' (propio)' : h.horario ? ' (de la empresa)' : ''}`]],
+    filas: [...h.dias.map(d => [fechaBO(d.dia), diaSem(d.dia), d.horario, d.h_entrada, d.h_salida, d.h_minutos, d.horario ? d.laboral : null,
+      d.entrada, d.salida, d.descanso_ini, d.descanso_fin, d.descanso, d.total, d.minutos, d.retraso || null, d.anticipada || null, d.falta || null, d.obs]),
+    ['Totales', '', '', '', '', null, t.laborables, '', '', '', '', t.descanso, t.total, t.minutos, t.retraso, t.anticipada, t.faltas,
+      `${t.dias} ${t.dias === 1 ? 'día trabajado' : 'días trabajados'} · ${t.retrasos} ${t.retrasos === 1 ? 'retraso' : 'retrasos'} · ${t.sin_salida} sin salida`]],
+  };
+}
+
+app.get('/api/reportes/empleados', async (req, res) => {
+  const { desde, hasta } = rangoParam(req.query);
+  const { hojas, departamentos } = await hojasFiltradas(req, desde, hasta);
+  const filas = hojas.map(({ dias, totales, ...p }) => ({ ...p, ...totales }));
+  if (req.query.formato === 'xlsx')
+    return enviarXlsx(res, `reporte_empleados_${desde}_${hasta}`, 'Empleados',
+      [['PIN', 10], ['Empleado', 28], ['CI', 12], ['Empresa', 22], ['Departamento', 16], ['Horario', 16], ['Días laborables', 10],
+        ['Días trabajados', 10], ['Horas trabajadas', 10, 'horas'], ['Retrasos', 9], ['Retraso total', 10, 'horas'],
+        ['Salida anticipada', 10, 'horas'], ['Faltas', 8], ['Días sin salida', 10]],
+      filas.map(f => [f.pin, f.nombre || 'No registrado', f.ci, f.empresa, f.departamento, f.horario, f.laborables, f.dias, f.minutos,
+        f.retrasos, f.retraso, f.anticipada, f.faltas, f.sin_salida]));
+  res.json({ desde, hasta, filas, departamentos });
+});
+
+// Hojas de todo el personal filtrado: para imprimirlas juntas (una página por persona) o en Excel (una pestaña cada una)
+app.get('/api/reportes/hojas', async (req, res) => {
+  const { desde, hasta } = rangoParam(req.query);
+  const { hojas } = await hojasFiltradas(req, desde, hasta);
+  if (req.query.formato === 'xlsx') {
+    if (!hojas.length) throw new HttpError(404, 'No hay personal con esos filtros');
+    return enviarLibro(res, `hojas_asistencia_${desde}_${hasta}`, hojas.map(h => hojaExcel(h, desde, hasta)));
+  }
+  res.json({ desde, hasta, hojas });
+});
+
+app.get('/api/reportes/empleado', async (req, res) => {
+  const { desde, hasta } = rangoParam(req.query);
+  const emp = empresaScope(req, req.query.empresa_id), suc = numId(req.query.sucursal_id);
+  const empleado_id = numId(req.query.empleado_id), pin = empleado_id ? null : clean(req.query.pin) || null;
+  if (!empleado_id && !pin) throw new HttpError(400, 'Elige un empleado');
+  if (pin && !emp) throw new HttpError(400, 'Elige la empresa');
+  const persona = empleado_id
+    ? await one(`SELECT 'e' || e.id clave, e.id empleado_id, e.empresa_id, x.nombre empresa, e.pin, e.nombre, e.ci, e.departamento, e.cargo,
+        COALESCE(e.ingreso, (e.creado AT TIME ZONE 'America/La_Paz')::date)::text alta
+        FROM empleados e JOIN empresas x ON x.id=e.empresa_id WHERE e.id=$1 AND ($2::int IS NULL OR e.empresa_id=$2)`, [empleado_id, emp])
+    : await one(`SELECT 'p' || id || '-' || $2 clave, NULL::int empleado_id, id empresa_id, nombre empresa, $2::text pin FROM empresas WHERE id=$1`, [emp, pin]);
+  if (!persona) throw new HttpError(404, 'El empleado no existe');
+  const [js, ctx] = await Promise.all([jornadas(emp, { desde, hasta, suc, empleado_id, pin }), contextoHorarios(emp, desde, hasta)]);
+  const [hoja] = armarHojas([persona], js, ctx, desde, hasta);
+  if (req.query.formato === 'xlsx') return enviarLibro(res, `asistencia_${persona.pin}_${desde}_${hasta}`, [hojaExcel(hoja, desde, hasta)]);
+  res.json({ desde, hasta, hoja });
+});
+
+app.get('/api/reportes/sucursales', async (req, res) => {
+  const { desde, hasta } = rangoParam(req.query);
+  const emp = empresaScope(req, req.query.empresa_id), suc = numId(req.query.sucursal_id);
+  const { rows } = await q(`
+    SELECT s.id sucursal_id, s.nombre sucursal, s.empresa_id, x.nombre empresa,
+      (SELECT count(DISTINCT ed.empleado_id) FROM empleado_dispositivo ed JOIN dispositivos d ON d.id=ed.dispositivo_id
+         JOIN empleados em ON em.id=ed.empleado_id WHERE d.sucursal_id=s.id AND ed.estado<>'eliminando' AND em.activo)::int empleados
+    FROM sucursales s JOIN empresas x ON x.id=s.empresa_id
+    WHERE ($1::int IS NULL OR s.empresa_id=$1) AND ($2::int IS NULL OR s.id=$2)
+    ORDER BY x.nombre, s.nombre`, [emp, suc]);
+  const filas = new Map(rows.map(s => [s.sucursal_id, { ...s, asistieron: new Set(), jornadas: 0, marcaciones: 0, minutos: 0, sin_salida: 0 }]));
+  for (const j of await jornadas(emp, { desde, hasta, suc })) {
+    const f = filas.get(j.sucursal_id);
+    if (!f) continue; // equipo sin sucursal
+    f.asistieron.add(j.clave); f.jornadas++; f.marcaciones += j.marcaciones;
+    if (j.minutos == null) f.sin_salida++; else f.minutos += j.minutos;
+  }
+  const lista = [...filas.values()].map(f => ({ ...f, asistieron: f.asistieron.size }));
+  if (req.query.formato === 'xlsx')
+    return enviarXlsx(res, `reporte_sucursales_${desde}_${hasta}`, 'Sucursales',
+      [['Sucursal', 24], ['Empresa', 24], ['Empleados', 11], ['Asistieron', 11], ['Jornadas', 11], ['Marcaciones', 12],
+        ['Horas', 10, 'horas'], ['Jornadas sin salida', 12]],
+      lista.map(f => [f.sucursal, f.empresa, f.empleados, f.asistieron, f.jornadas, f.marcaciones, f.minutos, f.sin_salida]));
+  res.json({ desde, hasta, filas: lista });
+});
+
+app.get('/api/reportes/fecha', async (req, res) => {
+  const dia = fechaParam(req.query.dia, 'del reporte');
+  const { hojas } = await hojasFiltradas(req, dia, dia);
+  // sucursal: donde marcó; si no marcó, las de sus relojes
+  const lista = hojas.map(({ dias: [d], totales, ...p }) => ({ ...p, ...d, sucursal: d.sucursal || p.sucursal }));
+  const totales = { presentes: 0, faltas: 0, retrasos: 0, sin_salida: 0, minutos: 0 };
+  for (const f of lista) {
+    if (f.marcaciones) totales.presentes++;
+    if (f.marcaciones && !f.salida) totales.sin_salida++;
+    totales.faltas += f.falta; totales.retrasos += f.retraso ? 1 : 0; totales.minutos += f.minutos || 0;
+  }
+  if (req.query.formato === 'xlsx')
+    return enviarXlsx(res, `asistencia_${dia}`, fechaBO(dia).replace(/\//g, '-'),
+      [['PIN', 10], ['Empleado', 28], ['CI', 12], ['Empresa', 22], ['Departamento', 16], ['Sucursal', 18], ['Horario', 14],
+        ['Entrada', 9], ['Descanso', 13], ['Salida', 9], ['Horas trabajadas', 10, 'horas'], ['Retraso', 9, 'horas'],
+        ['Salida anticipada', 10, 'horas'], ['Falta', 7], ['Estado', 34]],
+      lista.map(f => [f.pin, f.nombre || 'No registrado', f.ci, f.empresa, f.departamento, f.sucursal,
+        f.h_entrada ? `${f.h_entrada}–${f.h_salida}` : f.horario, f.entrada, f.almuerzo, f.salida, f.minutos,
+        f.retraso || null, f.anticipada || null, f.falta || null, ESTADO_DIA[f.estado] + (f.obs ? ` · ${f.obs}` : '')]));
+  res.json({ dia, totales, filas: lista });
+});
+
+// Detalle de marcaciones: una fila por marcación. El reloj no dice si es entrada o salida (manda el estado 255),
+// así que cada una se nombra con la misma regla de las jornadas, para que coincida con las horas de los reportes.
+const ESTADO_MARC = { entrada: 'Entrada', salida: 'Salida', descanso_ini: 'Salida a descanso', descanso_fin: 'Regreso de descanso',
+  intermedia: 'Intermedia' };
+const VERIFICACION = { 0: 'Clave', 1: 'Huella', 2: 'Tarjeta', 3: 'Clave', 4: 'Tarjeta', 15: 'Rostro', 25: 'Palma' };
+const MAX_MARC_PANTALLA = 3000; // en pantalla; el Excel las trae todas
+
+// horas: las de una persona en un día, en orden. La que llega a menos de 2 min de la última que cuenta es repetida
+// y se nombra como esa. Con 3 que cuentan, la del medio no entra en el cálculo: es "intermedia".
+function estadosDelDia(horas) {
+  const cuentan = [];
+  const de = horas.map((h, i) => {
+    if (!cuentan.length || segHora(h) - segHora(horas[cuentan.at(-1)]) >= REPETIDA_SEG) cuentan.push(i);
+    return cuentan.at(-1);
+  });
+  const n = cuentan.length, pos = new Map(cuentan.map((i, k) => [i, k]));
+  const estado = k => k === 0 ? 'entrada' : k === n - 1 ? 'salida' :
+    n >= 4 && k === 1 ? 'descanso_ini' : n >= 4 && k === 2 ? 'descanso_fin' : 'intermedia';
+  return horas.map((_, i) => ({ estado: estado(pos.get(de[i])), repetida: de[i] !== i }));
+}
+
+app.get('/api/reportes/marcaciones', async (req, res) => {
+  const { desde, hasta } = rangoParam(req.query);
+  const emp = empresaScope(req, req.query.empresa_id), suc = numId(req.query.sucursal_id), dev = numId(req.query.dispositivo_id);
+  const buscar = clean(req.query.buscar).toLowerCase(), dep = clean(req.query.departamento);
+  const [{ rows }, personas] = await Promise.all([q(`
+    SELECT d.empresa_id, x.nombre empresa, e.id empleado_id, COALESCE(e.pin, m.pin) pin, e.nombre, e.ci, e.departamento, e.cargo,
+      to_char(m.fecha, 'YYYY-MM-DD') dia, to_char(m.fecha, 'HH24:MI:SS') hora, m.verificacion,
+      d.id dispositivo_id, d.nombre dispositivo, d.sucursal_id, s.nombre sucursal
+    FROM marcaciones m
+    JOIN dispositivos d ON d.id=m.dispositivo_id
+    JOIN empresas x ON x.id=d.empresa_id
+    LEFT JOIN sucursales s ON s.id=d.sucursal_id
+    LEFT JOIN LATERAL (SELECT em.id, em.pin, em.nombre, em.ci, em.departamento, em.cargo FROM empleados em
+      WHERE em.empresa_id=d.empresa_id AND (em.pin=m.pin OR m.pin = ANY(em.pines_anteriores))
+      ORDER BY em.pin=m.pin DESC LIMIT 1) e ON TRUE
+    WHERE ($1::int IS NULL OR d.empresa_id=$1) AND m.fecha >= $2::date AND m.fecha < $3::date + 1
+    ORDER BY m.fecha, m.id`, [emp, desde, hasta]), esperados(emp, suc)]);
+  // El estado sale de todas las marcaciones de la persona ese día, en cualquier reloj; recién después se filtra
+  const dias = new Map();
+  for (const r of rows) {
+    r.clave = r.empleado_id ? `e${r.empleado_id}` : `p${r.empresa_id}-${r.pin}`;
+    const k = `${r.clave}|${r.dia}`;
+    if (!dias.has(k)) dias.set(k, []);
+    dias.get(k).push(r);
+  }
+  for (const lista of dias.values())
+    estadosDelDia(lista.map(r => r.hora)).forEach(({ estado, repetida }, i) => Object.assign(lista[i], {
+      estado, repetida, estado_texto: ESTADO_MARC[estado] + (repetida ? ' (repetida)' : '') }));
+  const incluir = r => (!suc || r.sucursal_id === suc) && (!dev || r.dispositivo_id === dev) && (!dep || r.departamento === dep) &&
+    (!buscar || [r.nombre, r.pin, r.ci].some(v => String(v || '').toLowerCase().includes(buscar)));
+  const filas = rows.filter(incluir)
+    .sort((a, b) => porNombre(a, b) || a.dia.localeCompare(b.dia) || a.hora.localeCompare(b.hora))
+    .map(({ verificacion, ...r }) => ({ ...r, metodo: VERIFICACION[verificacion] || (verificacion ? `Código ${verificacion}` : '') }));
+  if (req.query.formato === 'xlsx') {
+    const ec = !emp; // la plataforma con "Todas las empresas"
+    return enviarLibro(res, `marcaciones_${desde}_${hasta}`, [{ nombre: 'Marcaciones', horizontal: true,
+      columnas: [['ID empleado', 12], ['Empleado', 28], ['CI', 12], ...(ec ? [['Empresa', 22]] : []), ['Departamento', 18], ['Cargo', 16],
+        ['Fecha', 12, 'fecha'], ['Día', 7], ['Sucursal', 18], ['Dispositivo', 22], ['Hora marcación', 13, 'hora'],
+        ['Estado de marcación', 24], ['Método de verificación', 15]],
+      filas: filas.map(f => [f.pin, f.nombre || 'No registrado', f.ci, ...(ec ? [f.empresa] : []), f.departamento, f.cargo,
+        f.dia, diaSem(f.dia).slice(0, 3), f.sucursal, f.dispositivo, f.hora, f.estado_texto, f.metodo]) }]);
+  }
+  res.json({ desde, hasta, total: filas.length, personas: new Set(filas.map(f => f.clave)).size,
+    filas: filas.slice(0, MAX_MARC_PANTALLA), departamentos: [...new Set(personas.map(p => p.departamento).filter(Boolean))].sort() });
+});
+
+// ---------------- Horarios y feriados ----------------
+// Los gestionan la plataforma y los usuarios de la empresa con perfil administrador; los de consulta solo los ven.
+async function enTransaccion(fn) {
+  const c = await pool.connect();
+  try { await c.query('BEGIN'); const r = await fn(c); await c.query('COMMIT'); return r; }
+  catch (e) { await c.query('ROLLBACK'); throw e; } finally { c.release(); }
+}
+function datosHorario(b) {
+  const nombre = clean(b.nombre), tolerancia = Number(b.tolerancia || 0), hhmm = v => clean(v).slice(0, 5);
+  if (!nombre) throw new HttpError(400, 'Ponle un nombre al horario');
+  if (!Number.isInteger(tolerancia) || tolerancia < 0 || tolerancia > 240) throw new HttpError(400, 'La tolerancia va de 0 a 240 minutos');
+  const dias = [].concat(b.dias || []).map(d => ({ dia: Number(d.dia), entrada: hhmm(d.entrada), salida: hhmm(d.salida), limite_falta: hhmm(d.limite_falta) }));
+  if (!dias.length) throw new HttpError(400, 'Marca al menos un día de trabajo');
+  if (new Set(dias.map(d => d.dia)).size !== dias.length) throw new HttpError(400, 'Hay un día repetido');
+  for (const d of dias) {
+    const nom = DIA_SEM[d.dia];
+    if (!Number.isInteger(d.dia) || !nom) throw new HttpError(400, 'Día no válido');
+    if (![d.entrada, d.salida, d.limite_falta].every(h => /^([01]\d|2[0-3]):[0-5]\d$/.test(h))) throw new HttpError(400, `${nom}: completa las horas`);
+    if (!(d.entrada < d.limite_falta && d.limite_falta < d.salida))
+      throw new HttpError(400, `${nom}: la hora de falta debe quedar entre la entrada y la salida`);
+  }
+  return { nombre, tolerancia, dias };
+}
+async function nombreHorarioLibre(empresa_id, nombre, id = 0) {
+  if (await one(`SELECT 1 FROM horarios WHERE empresa_id=$1 AND lower(nombre)=lower($2) AND id<>$3`, [empresa_id, nombre, id]))
+    throw new HttpError(409, `Ya hay un horario llamado "${nombre}"`);
+}
+async function guardarDias(c, horario_id, dias) {
+  await c.query(`DELETE FROM horario_dias WHERE horario_id=$1`, [horario_id]);
+  for (const d of dias) await c.query(`INSERT INTO horario_dias (horario_id, dia, entrada, salida, limite_falta) VALUES ($1,$2,$3,$4,$5)`,
+    [horario_id, d.dia, d.entrada, d.salida, d.limite_falta]);
+}
+async function horarioPropio(req, id) {
+  const h = await one(`SELECT * FROM horarios WHERE id=$1`, [id]);
+  if (!h) throw new HttpError(404, 'El horario no existe');
+  checkEmpresa(req, h.empresa_id);
+  return h;
+}
+
+app.get('/api/horarios', async (req, res) => {
+  const emp = empresaScope(req, req.query.empresa_id);
+  const { rows } = await q(`
+    SELECT h.id, h.empresa_id, x.nombre empresa, h.nombre, h.tolerancia,
+      COALESCE((SELECT json_agg(json_build_object('dia', d.dia, 'entrada', to_char(d.entrada,'HH24:MI'), 'salida', to_char(d.salida,'HH24:MI'),
+          'limite_falta', to_char(d.limite_falta,'HH24:MI')) ORDER BY d.dia) FROM horario_dias d WHERE d.horario_id=h.id), '[]') dias,
+      (SELECT count(*)::int FROM empleados e WHERE e.empresa_id=h.empresa_id AND e.activo
+         AND horario_vigente(e.id, (now() AT TIME ZONE 'America/La_Paz')::date) = h.id) empleados,
+      COALESCE((SELECT eh.horario_id FROM empresa_horario eh WHERE eh.empresa_id=h.empresa_id
+         AND eh.desde <= (now() AT TIME ZONE 'America/La_Paz')::date ORDER BY eh.desde DESC LIMIT 1) = h.id, false) principal
+    FROM horarios h JOIN empresas x ON x.id=h.empresa_id
+    WHERE ($1::int IS NULL OR h.empresa_id=$1) ORDER BY x.nombre, h.nombre`, [emp]);
   res.json(rows);
 });
 
-// Usuarios del sistema (logins)
+// Horario principal de cada empresa: el actual, los cambios anteriores y los programados, y cuántos tienen excepción hoy
+app.get('/api/horarios/principal', async (req, res) => {
+  const emp = empresaScope(req, req.query.empresa_id);
+  const { rows } = await q(`
+    SELECT x.id empresa_id, x.nombre empresa,
+      COALESCE((SELECT json_agg(json_build_object('desde', eh.desde::text, 'horario_id', eh.horario_id, 'horario', h.nombre) ORDER BY eh.desde DESC)
+        FROM empresa_horario eh LEFT JOIN horarios h ON h.id=eh.horario_id WHERE eh.empresa_id=x.id), '[]') cambios,
+      (SELECT count(*)::int FROM empleados e WHERE e.empresa_id=x.id AND e.activo AND (SELECT modo FROM empleado_horario
+         WHERE empleado_id=e.id AND desde <= (now() AT TIME ZONE 'America/La_Paz')::date ORDER BY desde DESC LIMIT 1) <> 'empresa') excepciones
+    FROM empresas x WHERE ($1::int IS NULL OR x.id=$1) ORDER BY x.nombre`, [emp]);
+  res.json({ hoy: ahoraBO().slice(0, 10), empresas: rows });
+});
+// Pone o cambia el horario principal desde una fecha (horario_id vacío = sin horario desde esa fecha)
+app.post('/api/horarios/principal', async (req, res) => {
+  soloEditor(req);
+  const empresa_id = isAdmin(req) ? numId(req.body.empresa_id) : req.user.empresa_id;
+  const horario_id = numId(req.body.horario_id), desde = fechaParam(req.body.desde, '"desde"');
+  if (!empresa_id) throw new HttpError(400, 'Elige la empresa');
+  if (horario_id && (await horarioPropio(req, horario_id)).empresa_id !== empresa_id) throw new HttpError(400, 'Ese horario es de otra empresa');
+  await q(`INSERT INTO empresa_horario (empresa_id, desde, horario_id) VALUES ($1,$2,$3)
+           ON CONFLICT (empresa_id, desde) DO UPDATE SET horario_id=EXCLUDED.horario_id`, [empresa_id, desde, horario_id]);
+  res.json({ ok: true });
+});
+// Quita un cambio del horario principal (por ejemplo, uno cargado con la fecha equivocada)
+app.delete('/api/horarios/principal', async (req, res) => {
+  soloEditor(req);
+  const empresa_id = isAdmin(req) ? numId(req.query.empresa_id) : req.user.empresa_id, desde = fechaParam(req.query.desde, '"desde"');
+  const r = await q(`DELETE FROM empresa_horario WHERE empresa_id=$1 AND desde=$2`, [empresa_id, desde]);
+  if (!r.rowCount) throw new HttpError(404, 'Ese cambio no existe');
+  res.json({ ok: true });
+});
+app.post('/api/horarios', async (req, res) => {
+  soloEditor(req);
+  const empresa_id = isAdmin(req) ? numId(req.body.empresa_id) : req.user.empresa_id;
+  if (!empresa_id) throw new HttpError(400, 'Elige la empresa');
+  const { nombre, tolerancia, dias } = datosHorario(req.body);
+  await nombreHorarioLibre(empresa_id, nombre);
+  res.json(await enTransaccion(async c => {
+    const h = (await c.query(`INSERT INTO horarios (empresa_id, nombre, tolerancia) VALUES ($1,$2,$3) RETURNING *`, [empresa_id, nombre, tolerancia])).rows[0];
+    await guardarDias(c, h.id, dias);
+    return h;
+  }));
+});
+// Ojo: cambiar un horario también cambia los reportes de fechas pasadas de quienes lo tenían
+app.put('/api/horarios/:id', async (req, res) => {
+  soloEditor(req);
+  const h = await horarioPropio(req, req.params.id);
+  const { nombre, tolerancia, dias } = datosHorario(req.body);
+  await nombreHorarioLibre(h.empresa_id, nombre, h.id);
+  res.json(await enTransaccion(async c => {
+    await c.query(`UPDATE horarios SET nombre=$2, tolerancia=$3 WHERE id=$1`, [h.id, nombre, tolerancia]);
+    await guardarDias(c, h.id, dias);
+    return { ok: true };
+  }));
+});
+app.delete('/api/horarios/:id', async (req, res) => {
+  soloEditor(req);
+  const h = await horarioPropio(req, req.params.id);
+  const { n } = await one(`SELECT count(DISTINCT empleado_id)::int n FROM empleado_horario WHERE horario_id=$1`, [h.id]);
+  if (n) throw new HttpError(409, `Este horario está o estuvo asignado a ${n} empleado(s) y sus reportes dependen de él. Crea uno nuevo en lugar de eliminarlo.`);
+  if (await one(`SELECT 1 FROM empresa_horario WHERE horario_id=$1`, [h.id]))
+    throw new HttpError(409, 'Este horario es o fue el principal de la empresa y sus reportes dependen de él. Crea uno nuevo en lugar de eliminarlo.');
+  await q(`DELETE FROM horarios WHERE id=$1`, [h.id]);
+  res.json({ ok: true });
+});
+
+// Excepción para varios empleados desde una fecha: un horario propio ('horario'), sin control ('sin_horario')
+// o volver al horario de la empresa ('empresa'). Lo anterior a esa fecha no cambia.
+app.post('/api/horarios/asignar', async (req, res) => {
+  soloEditor(req);
+  const ids = [...new Set([].concat(req.body.empleados || []).map(Number).filter(Boolean))];
+  const modo = req.body.modo || (req.body.horario_id ? 'horario' : 'empresa');
+  const horario_id = modo === 'horario' ? numId(req.body.horario_id) : null, desde = fechaParam(req.body.desde, '"desde"');
+  if (!['horario', 'sin_horario', 'empresa'].includes(modo)) throw new HttpError(400, 'Opción no válida');
+  if (modo === 'horario' && !horario_id) throw new HttpError(400, 'Elige el horario');
+  if (!ids.length) throw new HttpError(400, 'Elige al menos un empleado');
+  const { rows } = await q(`SELECT DISTINCT empresa_id FROM empleados WHERE id = ANY($1)`, [ids]);
+  const { n } = await one(`SELECT count(*)::int n FROM empleados WHERE id = ANY($1)`, [ids]);
+  if (n !== ids.length) throw new HttpError(400, 'Hay empleados que no existen');
+  if (rows.length !== 1) throw new HttpError(400, 'Elige empleados de una sola empresa');
+  const empresa_id = rows[0].empresa_id;
+  checkEmpresa(req, empresa_id);
+  if (horario_id && (await horarioPropio(req, horario_id)).empresa_id !== empresa_id)
+    throw new HttpError(400, 'Ese horario es de otra empresa');
+  await q(`INSERT INTO empleado_horario (empleado_id, desde, horario_id, modo) SELECT unnest($1::int[]), $2, $3, $4
+           ON CONFLICT (empleado_id, desde) DO UPDATE SET horario_id=EXCLUDED.horario_id, modo=EXCLUDED.modo`, [ids, desde, horario_id, modo]);
+  res.json({ ok: true, asignados: ids.length });
+});
+
+app.get('/api/feriados', async (req, res) => {
+  const emp = empresaScope(req, req.query.empresa_id);
+  const anio = Number(req.query.anio) || Number(ahoraBO().slice(0, 4));
+  const { rows } = await q(`SELECT f.id, f.fecha::text fecha, f.nombre, f.empresa_id, x.nombre empresa
+    FROM feriados f LEFT JOIN empresas x ON x.id=f.empresa_id
+    WHERE EXTRACT(year FROM f.fecha) = $2 AND (f.empresa_id IS NULL OR $1::int IS NULL OR f.empresa_id=$1)
+    ORDER BY f.fecha, f.empresa_id NULLS FIRST`, [emp, anio]);
+  res.json(rows);
+});
+app.post('/api/feriados', async (req, res) => {
+  soloEditor(req);
+  // Sin empresa = nacional (vale para todas): solo lo carga la plataforma
+  const empresa_id = isAdmin(req) ? numId(req.body.empresa_id) : req.user.empresa_id;
+  const fecha = fechaParam(req.body.fecha, 'del feriado'), nombre = clean(req.body.nombre);
+  if (!nombre) throw new HttpError(400, 'Ponle un nombre al feriado');
+  if (await one(`SELECT 1 FROM feriados WHERE fecha=$1 AND (empresa_id IS NULL OR empresa_id IS NOT DISTINCT FROM $2::int)`, [fecha, empresa_id]))
+    throw new HttpError(409, 'Ese día ya está cargado como feriado');
+  res.json(await one(`INSERT INTO feriados (empresa_id, fecha, nombre) VALUES ($1,$2,$3) RETURNING id`, [empresa_id, fecha, nombre]));
+});
+app.delete('/api/feriados/:id', async (req, res) => {
+  soloEditor(req);
+  const f = await one(`SELECT * FROM feriados WHERE id=$1`, [req.params.id]);
+  if (!f) throw new HttpError(404, 'El feriado no existe');
+  if (!isAdmin(req) && f.empresa_id !== req.user.empresa_id)
+    throw new HttpError(403, f.empresa_id ? 'No autorizado' : 'Los feriados nacionales los administra soporte');
+  await q(`DELETE FROM feriados WHERE id=$1`, [f.id]);
+  res.json({ ok: true });
+});
+
+// Usuarios del sistema (logins). La plataforma gestiona todos; el administrador de una empresa, solo los de
+// su empresa, y nunca puede crear usuarios de la plataforma.
+const PERFILES = ['administrador', 'consulta'];
+async function usuarioGestionable(req, id) {
+  const u = await one(`SELECT * FROM usuarios_sistema WHERE id=$1`, [id]);
+  if (!u) throw new HttpError(404, 'El usuario no existe');
+  if (!isAdmin(req) && (u.rol !== 'empresa' || u.empresa_id !== req.user.empresa_id)) throw new HttpError(403, 'No autorizado');
+  return u;
+}
 app.get('/api/usuarios-sistema', async (req, res) => {
-  soloAdmin(req);
-  const { rows } = await q(`SELECT u.id,u.email,u.nombre,u.rol,u.empresa_id,e.nombre empresa,u.creado
-    FROM usuarios_sistema u LEFT JOIN empresas e ON e.id=u.empresa_id ORDER BY u.rol, e.nombre, u.email`);
+  soloEditor(req);
+  const { rows } = await q(`SELECT u.id,u.email,u.nombre,u.rol,u.perfil,u.empresa_id,e.nombre empresa,u.creado
+    FROM usuarios_sistema u LEFT JOIN empresas e ON e.id=u.empresa_id
+    WHERE ($1::int IS NULL OR u.empresa_id=$1) ORDER BY u.rol, e.nombre, u.email`, [isAdmin(req) ? null : req.user.empresa_id]);
   res.json(rows);
 });
 app.post('/api/usuarios-sistema', async (req, res) => {
-  soloAdmin(req);
-  const { email, nombre, password, rol = 'empresa', empresa_id } = req.body;
+  soloEditor(req);
+  const { email, nombre, password, perfil = 'administrador' } = req.body;
+  const rol = isAdmin(req) && req.body.rol === 'admin' ? 'admin' : 'empresa';
+  const empresa_id = rol === 'admin' ? null : isAdmin(req) ? req.body.empresa_id : req.user.empresa_id;
   if (!clean(email) || !password || password.length < 6) throw new HttpError(400, 'Correo y contraseña (mín. 6) obligatorios');
   if (rol === 'empresa' && !empresa_id) throw new HttpError(400, 'Elige la empresa');
-  res.json(await one(`INSERT INTO usuarios_sistema (email,nombre,hash,rol,empresa_id) VALUES ($1,$2,$3,$4,$5) RETURNING id,email`,
-    [clean(email).toLowerCase(), clean(nombre), hashPass(password), rol === 'admin' ? 'admin' : 'empresa', rol === 'admin' ? null : empresa_id]));
+  if (!PERFILES.includes(perfil)) throw new HttpError(400, 'Perfil no válido');
+  res.json(await one(`INSERT INTO usuarios_sistema (email,nombre,hash,rol,empresa_id,perfil) VALUES ($1,$2,$3,$4,$5,$6) RETURNING id,email`,
+    [clean(email).toLowerCase(), clean(nombre), hashPass(password), rol, empresa_id, perfil]));
 });
 app.put('/api/usuarios-sistema/:id/password', async (req, res) => {
-  soloAdmin(req);
+  soloEditor(req);
+  const u = await usuarioGestionable(req, req.params.id);
   if (!req.body.password || req.body.password.length < 6) throw new HttpError(400, 'Mínimo 6 caracteres');
-  await q(`UPDATE usuarios_sistema SET hash=$2 WHERE id=$1`, [req.params.id, hashPass(req.body.password)]);
+  await q(`UPDATE usuarios_sistema SET hash=$2 WHERE id=$1`, [u.id, hashPass(req.body.password)]);
   res.json({ ok: true });
 });
 app.delete('/api/usuarios-sistema/:id', async (req, res) => {
-  soloAdmin(req);
+  soloEditor(req);
   if (Number(req.params.id) === req.user.id) throw new HttpError(400, 'No puedes eliminar tu propio usuario');
-  await q(`DELETE FROM usuarios_sistema WHERE id=$1`, [req.params.id]);
+  const u = await usuarioGestionable(req, req.params.id);
+  await q(`DELETE FROM usuarios_sistema WHERE id=$1`, [u.id]);
   res.json({ ok: true });
 });
 
-// Dashboard (archivos estáticos)
+// Dashboards: las empresas entran por /clientes y la plataforma por /admin
+app.get('/', (req, res) => res.redirect('/clientes/'));
 app.use(express.static(path.join(__dirname, 'public')));
 
 // Errores
@@ -998,7 +1676,7 @@ app.use((err, req, res, next) => {
 
 ensureDatabase()
   .then(() => app.listen(cfg.PORT, '0.0.0.0', () =>
-    log(`BioPanel escuchando en puerto ${cfg.PORT} → abre http://localhost:${cfg.PORT}`)))
+    log(`BioPanel escuchando en puerto ${cfg.PORT} → administración: http://localhost:${cfg.PORT}/admin · clientes: http://localhost:${cfg.PORT}/clientes`)))
   .catch(e => {
     console.error('\n❌ No pude conectar a PostgreSQL:', e.message);
     console.error('   Revisa DATABASE_URL en config.js (usuario, contraseña y puerto de PostgreSQL).\n');
