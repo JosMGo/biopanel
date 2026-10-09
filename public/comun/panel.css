@@ -158,6 +158,31 @@ tfoot td{font-weight:600;border-top:2px solid var(--line)}
 /* Formulario de horario */
 .dias th,.dias td{padding:6px 8px}
 .dias input[type=time]{width:120px}
+/* Turnos: color, "+1" (del día siguiente), pestañas, línea de tiempo */
+.grid3{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px}
+.punto{display:inline-block;width:11px;height:11px;border-radius:99px;vertical-align:-1px;margin-right:6px}
+.mas1{font-size:11.5px;padding:1px 7px;border-radius:99px;background:#ede9fe;color:#5b21b6;margin-left:4px;white-space:nowrap;font-weight:500}
+.con-mas1{display:flex;align-items:center;gap:6px}
+.con-mas1 input{flex:1;min-width:0}
+.tabs{display:flex;gap:4px;border-bottom:1px solid var(--line);flex-wrap:wrap}
+.tabs button{border:0;background:none;padding:10px 12px;border-bottom:2px solid transparent;margin-bottom:-1px;color:var(--muted);cursor:pointer}
+.tabs button.on{color:var(--accent);border-bottom-color:var(--accent);font-weight:600}
+fieldset.grupo{border:1px solid var(--line);border-radius:10px;padding:12px 14px 14px;margin:0;display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px;align-content:start}
+fieldset.grupo legend{padding:0 6px;font-weight:600;font-size:13px}
+.linea{border:1px solid var(--line);border-radius:10px;padding:12px 14px;display:flex;flex-direction:column;gap:10px;font-size:13px}
+.linea .filas{display:grid;grid-template-columns:84px minmax(0,1fr);gap:8px 10px;align-items:center;font-size:12px;color:var(--muted)}
+.linea .barra{position:relative;height:20px;background:var(--bg);border-radius:6px}
+.linea .barra span{position:absolute;top:0;bottom:0;border-radius:6px}
+.linea .barra i{position:absolute;top:-5px;bottom:-5px;width:2px;background:#5b21b6}
+.linea .eje{position:relative;height:16px}
+.linea .eje span{position:absolute;transform:translateX(-50%);font-size:11px;white-space:nowrap;font-variant-numeric:tabular-nums}
+.linea .leyenda{display:flex;gap:14px;flex-wrap:wrap;font-size:12px;color:var(--muted)}
+.linea .leyenda span{display:flex;align-items:center;gap:6px}
+.linea .leyenda i{display:inline-block;width:14px;height:10px;border-radius:3px}
+.reglas{background:var(--bg);border-radius:10px;padding:12px 14px;display:flex;flex-direction:column;gap:6px;font-size:13px}
+.opcion{display:flex;gap:12px;align-items:flex-start;border:1px solid var(--line);border-radius:10px;padding:12px 14px;cursor:pointer}
+.opcion>span{display:flex;flex-direction:column;gap:2px}
+.opcion input{margin-top:3px}
 @page hoja{size:A4 landscape;margin:8mm}
 .hoja{page:hoja}
 
@@ -167,7 +192,7 @@ tfoot td{font-weight:600;border-top:2px solid var(--line)}
   aside.open{transform:none}
   .menu-btn{display:inline-flex}
   main{padding:16px}
-  .two,.grid2{grid-template-columns:1fr}
+  .two,.grid2,.grid3,fieldset.grupo{grid-template-columns:1fr}
   th,td{padding:8px 10px}
 }
 /* Impresión / PDF de reportes: siempre en colores claros y solo el contenido */

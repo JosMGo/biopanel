@@ -73,16 +73,32 @@ ALTER TABLE empleados ADD COLUMN IF NOT EXISTS pines_anteriores TEXT[] DEFAULT '
 ALTER TABLE empleados ADD COLUMN IF NOT EXISTS ingreso DATE;
 ALTER TABLE usuarios_sistema ADD COLUMN IF NOT EXISTS perfil TEXT NOT NULL DEFAULT 'administrador'
   CHECK (perfil IN ('administrador','consulta'));
--- Horarios: tolerancia en minutos; por cada día que se trabaja (0 = domingo … 6 = sábado), la entrada,
--- la salida y la hora desde la que llegar cuenta como falta. Un día sin fila es libre.
+-- Turnos: catálogo de cada empresa. Horas "de reloj": una hora menor que la entrada es del día siguiente
+-- (un turno de 22:00 a 06:00 termina al otro día y pertenece al día en que empieza). marca_desde/marca_hasta:
+-- entre qué horas una marcación se toma como de este turno. Descanso (opcional, flexible): puede salir desde
+-- descanso_desde, dura descanso_min y, si vuelve después de descanso_limite, falta a la 2.ª parte del turno.
+-- vale: cuánto de un día es (una falta resta eso). fuera: qué hacer con marcaciones fuera de marca_desde/hasta.
+CREATE TABLE IF NOT EXISTS turnos (
+  id SERIAL PRIMARY KEY, empresa_id INT NOT NULL REFERENCES empresas(id) ON DELETE CASCADE,
+  nombre TEXT NOT NULL, color TEXT NOT NULL DEFAULT 'teal', vale NUMERIC(3,1) NOT NULL DEFAULT 1 CHECK (vale > 0 AND vale <= 3),
+  entrada TIME NOT NULL, salida TIME NOT NULL, limite_falta TIME NOT NULL, marca_desde TIME NOT NULL, marca_hasta TIME NOT NULL,
+  tolerancia INT NOT NULL DEFAULT 0 CHECK (tolerancia BETWEEN 0 AND 240),
+  descanso_desde TIME, descanso_min INT CHECK (descanso_min BETWEEN 1 AND 600), descanso_limite TIME,
+  fuera TEXT NOT NULL DEFAULT 'sin_turno' CHECK (fuera IN ('sin_turno','trabajadas')),
+  creado TIMESTAMPTZ DEFAULT now(), UNIQUE (empresa_id, nombre));
+-- Horarios semanales: qué turno toca cada día (0 = domingo … 6 = sábado). Un día sin fila es libre.
+-- (tolerancia y las horas por día son de la versión anterior: ahora van en el turno; se conservan sin usarse.)
 CREATE TABLE IF NOT EXISTS horarios (
   id SERIAL PRIMARY KEY, empresa_id INT NOT NULL REFERENCES empresas(id) ON DELETE CASCADE,
   nombre TEXT NOT NULL, tolerancia INT NOT NULL DEFAULT 0 CHECK (tolerancia BETWEEN 0 AND 240),
   creado TIMESTAMPTZ DEFAULT now(), UNIQUE (empresa_id, nombre));
 CREATE TABLE IF NOT EXISTS horario_dias (
   horario_id INT REFERENCES horarios(id) ON DELETE CASCADE, dia SMALLINT NOT NULL CHECK (dia BETWEEN 0 AND 6),
-  entrada TIME NOT NULL, salida TIME NOT NULL, limite_falta TIME NOT NULL,
-  PRIMARY KEY (horario_id, dia), CHECK (entrada < limite_falta AND limite_falta < salida));
+  turno_id INT REFERENCES turnos(id), entrada TIME, salida TIME, limite_falta TIME,
+  PRIMARY KEY (horario_id, dia));
+ALTER TABLE horario_dias ADD COLUMN IF NOT EXISTS turno_id INT REFERENCES turnos(id);
+ALTER TABLE horario_dias DROP CONSTRAINT IF EXISTS horario_dias_check;
+ALTER TABLE horario_dias ALTER COLUMN entrada DROP NOT NULL, ALTER COLUMN salida DROP NOT NULL, ALTER COLUMN limite_falta DROP NOT NULL;
 -- Horario principal de cada empresa desde una fecha: rige para todo su personal (NULL = sin horario desde esa fecha).
 -- Cambiarlo desde una fecha no altera los días anteriores.
 CREATE TABLE IF NOT EXISTS empresa_horario (
@@ -131,6 +147,7 @@ async function ensureDatabase() {
     log('Base de datos creada:', db);
   }
   await q(SCHEMA);
+  await migrarHorariosATurnos();
   const admin = await one(`SELECT id FROM usuarios_sistema WHERE rol='admin' LIMIT 1`);
   if (!admin) {
     await q(`INSERT INTO usuarios_sistema (email,nombre,hash,rol) VALUES ($1,'Administrador',$2,'admin')`,
@@ -1132,11 +1149,18 @@ function rangoParam(query) {
   return { desde, hasta };
 }
 
-const segHora = h => { const [a, b, c] = h.split(':').map(Number); return a * 3600 + b * 60 + c; };
-function calcularJornada(horas) {
+// Tiempos: un día es su número desde 1970 y una marcación, segundos desde ese origen; así un turno puede cruzar la medianoche.
+const segHora = h => { const [a, b, c] = h.split(':').map(Number); return a * 3600 + b * 60 + (c || 0); };
+const diaNum = d => Date.parse(d + 'T00:00:00Z') / 864e5;
+const numDia = n => new Date(n * 864e5).toISOString().slice(0, 10);
+const hhmm = min => { const x = ((min % 1440) + 1440) % 1440; return `${String(Math.floor(x / 60)).padStart(2, '0')}:${String(x % 60).padStart(2, '0')}`; };
+
+// ts: segundos de las marcaciones de una jornada, en orden. Entrada = la primera, salida = la última; con 4 o más,
+// la 2.ª y la 3.ª son el descanso y se descuenta. Las repetidas (menos de 2 min de la anterior que cuenta) no cuentan.
+function calcularJornada(ts) {
   const t = [];
-  for (const h of horas) if (!t.length || segHora(h) - segHora(t[t.length - 1]) >= REPETIDA_SEG) t.push(h);
-  const n = t.length, min = (a, b) => Math.round((segHora(b) - segHora(a)) / 60), hm = h => h.slice(0, 5);
+  for (const s of ts) if (!t.length || s - t[t.length - 1] >= REPETIDA_SEG) t.push(s);
+  const n = t.length, min = (a, b) => Math.round((b - a) / 60), hm = s => hhmm(Math.floor(s / 60));
   const total = n < 2 ? null : min(t[0], t[n - 1]), descanso = n >= 4 ? min(t[1], t[2]) : null;
   return {
     entrada: hm(t[0]), salida: n > 1 ? hm(t[n - 1]) : null,
@@ -1146,13 +1170,13 @@ function calcularJornada(horas) {
   };
 }
 
-async function jornadas(emp, { desde, hasta, suc = null, empleado_id = null, pin = null }) {
+// Marcaciones de [desde − 1, hasta + 1]: los días de al lado traen las de los turnos de noche que entran o salen del rango.
+// Filtros opcionales por persona (empleado_id, o pin si no está en el panel).
+async function marcasCrudas(emp, desde, hasta, { empleado_id = null, pin = null } = {}) {
   const { rows } = await q(`
     SELECT d.empresa_id, x.nombre empresa, e.id empleado_id, COALESCE(e.pin, m.pin) pin, e.nombre, e.ci, e.departamento, e.cargo, e.alta,
-      to_char(m.fecha, 'YYYY-MM-DD') dia,
-      (array_agg(d.sucursal_id ORDER BY m.fecha))[1] sucursal_id,
-      (array_agg(s.nombre ORDER BY m.fecha))[1] sucursal,
-      array_agg(to_char(m.fecha, 'HH24:MI:SS') ORDER BY m.fecha) horas
+      to_char(m.fecha, 'YYYY-MM-DD') dia, to_char(m.fecha, 'HH24:MI:SS') hora, m.verificacion,
+      d.id dispositivo_id, d.nombre dispositivo, d.sucursal_id, s.nombre sucursal
     FROM marcaciones m
     JOIN dispositivos d ON d.id=m.dispositivo_id
     JOIN empresas x ON x.id=d.empresa_id
@@ -1161,14 +1185,14 @@ async function jornadas(emp, { desde, hasta, suc = null, empleado_id = null, pin
         COALESCE(em.ingreso, (em.creado AT TIME ZONE 'America/La_Paz')::date)::text alta FROM empleados em
       WHERE em.empresa_id=d.empresa_id AND (em.pin=m.pin OR m.pin = ANY(em.pines_anteriores))
       ORDER BY em.pin=m.pin DESC LIMIT 1) e ON TRUE
-    WHERE ($1::int IS NULL OR d.empresa_id=$1) AND m.fecha >= $2::date AND m.fecha < $3::date + 1
+    WHERE ($1::int IS NULL OR d.empresa_id=$1) AND m.fecha >= $2::date - 1 AND m.fecha < $3::date + 2
       AND ($4::int IS NULL OR e.id=$4) AND ($5::text IS NULL OR (e.id IS NULL AND m.pin=$5))
-    GROUP BY d.empresa_id, x.nombre, e.id, COALESCE(e.pin, m.pin), e.nombre, e.ci, e.departamento, e.cargo, e.alta, to_char(m.fecha, 'YYYY-MM-DD')
-    ORDER BY dia`, [emp, desde, hasta, empleado_id, pin]);
-  return rows.filter(r => !suc || r.sucursal_id === suc).map(({ horas, ...r }) => ({
-    ...r, clave: r.empleado_id ? `e${r.empleado_id}` : `p${r.empresa_id}-${r.pin}`,
-    marcaciones: horas.length, ...calcularJornada(horas),
-  }));
+    ORDER BY m.fecha, m.id`, [emp, desde, hasta, empleado_id, pin]);
+  for (const r of rows) {
+    r.clave = r.empleado_id ? `e${r.empleado_id}` : `p${r.empresa_id}-${r.pin}`;
+    r.t = diaNum(r.dia) * 86400 + segHora(r.hora);
+  }
+  return rows;
 }
 
 // Empleados que se espera ver: los activos de la empresa y, si se filtra por sucursal, con equipos en ella
@@ -1193,26 +1217,44 @@ const porNombre = (a, b) => a.empresa.localeCompare(b.empresa) || !a.nombre - !b
 // Por día: retraso = minutos desde la hora de entrada, solo si pasa la tolerancia; llegar después del límite
 // (o no marcar en un día laboral) es 1 día de falta; salida anticipada = minutos antes de la salida del horario.
 // Los días libres, los feriados y lo que todavía no pasó (hoy antes del límite, días futuros) no cuentan falta.
-const aMinutos = h => Number(h.slice(0, 2)) * 60 + Number(h.slice(3, 5));
 const aHoras = m => `${Math.floor(m / 60)}:${String(m % 60).padStart(2, '0')}`;
 const ahoraBO = () => new Date().toLocaleString('sv-SE', { timeZone: 'America/La_Paz' }); // 'AAAA-MM-DD HH:MM:SS'
 
+// Las horas de un turno en minutos desde las 00:00 del día en que empieza (E entrada, L límite de falta, S salida,
+// eD/sH desde y hasta cuándo acepta marcar, dD/dL/dur el descanso). Una hora menor que la entrada es del día siguiente;
+// "acepta desde", mayor que la entrada, del día anterior.
+function horasTurno(t) {
+  const E = aMin(t.entrada), despues = h => { const m = aMin(h); return m < E ? m + 1440 : m; };
+  const S = aMin(t.salida) <= E ? aMin(t.salida) + 1440 : aMin(t.salida);
+  let sH = despues(t.marca_hasta); if (sH < S) sH += 1440;
+  const eD = aMin(t.marca_desde) > E ? aMin(t.marca_desde) - 1440 : aMin(t.marca_desde);
+  const dur = t.descanso_min ? Number(t.descanso_min) : 0;
+  return { E, S, L: despues(t.limite_falta), eD, sH, dur, dD: dur ? despues(t.descanso_desde) : null, dL: dur ? despues(t.descanso_limite) : null };
+}
+const aMin = h => Number(String(h).slice(0, 2)) * 60 + Number(String(h).slice(3, 5));
+const TURNO_COLS = `t.id, t.empresa_id, t.nombre, t.color, t.vale::float vale, to_char(t.entrada,'HH24:MI') entrada, to_char(t.salida,'HH24:MI') salida,
+  to_char(t.limite_falta,'HH24:MI') limite_falta, to_char(t.marca_desde,'HH24:MI') marca_desde, to_char(t.marca_hasta,'HH24:MI') marca_hasta,
+  t.tolerancia, to_char(t.descanso_desde,'HH24:MI') descanso_desde, t.descanso_min, to_char(t.descanso_limite,'HH24:MI') descanso_limite, t.fuera`;
+
+// Lo que rige para cada persona y día. Cubre desde − 1 hasta hasta + 1 por los turnos de noche.
 async function contextoHorarios(emp, desde, hasta) {
   const [{ rows: hs }, { rows: ex }, { rows: pr }, { rows: fs }] = await Promise.all([
-    q(`SELECT h.id, h.nombre, h.tolerancia, d.dia, to_char(d.entrada,'HH24:MI') entrada, to_char(d.salida,'HH24:MI') salida,
-         to_char(d.limite_falta,'HH24:MI') limite_falta
-       FROM horarios h LEFT JOIN horario_dias d ON d.horario_id=h.id WHERE ($1::int IS NULL OR h.empresa_id=$1)`, [emp]),
+    q(`SELECT h.id hid, h.nombre hnombre, d.dia, ${TURNO_COLS}
+       FROM horarios h LEFT JOIN horario_dias d ON d.horario_id=h.id LEFT JOIN turnos t ON t.id=d.turno_id
+       WHERE ($1::int IS NULL OR h.empresa_id=$1)`, [emp]),
     q(`SELECT eh.empleado_id clave, eh.desde::text desde, eh.horario_id, eh.modo FROM empleado_horario eh JOIN empleados e ON e.id=eh.empleado_id
-       WHERE ($1::int IS NULL OR e.empresa_id=$1) AND eh.desde <= $2::date ORDER BY eh.empleado_id, eh.desde`, [emp, hasta]),
+       WHERE ($1::int IS NULL OR e.empresa_id=$1) AND eh.desde <= $2::date + 1 ORDER BY eh.empleado_id, eh.desde`, [emp, hasta]),
     q(`SELECT empresa_id clave, desde::text desde, horario_id FROM empresa_horario
-       WHERE ($1::int IS NULL OR empresa_id=$1) AND desde <= $2::date ORDER BY empresa_id, desde`, [emp, hasta]),
+       WHERE ($1::int IS NULL OR empresa_id=$1) AND desde <= $2::date + 1 ORDER BY empresa_id, desde`, [emp, hasta]),
     q(`SELECT fecha::text fecha, nombre, empresa_id FROM feriados
-       WHERE fecha BETWEEN $2::date AND $3::date AND ($1::int IS NULL OR empresa_id IS NULL OR empresa_id=$1)`, [emp, desde, hasta]),
+       WHERE fecha BETWEEN $2::date - 1 AND $3::date + 1 AND ($1::int IS NULL OR empresa_id IS NULL OR empresa_id=$1)`, [emp, desde, hasta]),
   ]);
-  const horarios = new Map();
-  for (const r of hs) {
-    if (!horarios.has(r.id)) horarios.set(r.id, { id: r.id, nombre: r.nombre, tolerancia: r.tolerancia, turnos: {} });
-    if (r.dia != null) horarios.get(r.id).turnos[r.dia] = { entrada: r.entrada, salida: r.salida, limite_falta: r.limite_falta };
+  const horarios = new Map(), turnos = new Map();
+  for (const { hid, hnombre, dia, ...t } of hs) {
+    if (!horarios.has(hid)) horarios.set(hid, { id: hid, nombre: hnombre, turnos: {} });
+    if (dia == null || !t.id) continue;
+    if (!turnos.has(t.id)) turnos.set(t.id, { ...t, h: horasTurno(t) });
+    horarios.get(hid).turnos[dia] = turnos.get(t.id);
   }
   const agrupar = filas => {
     const m = new Map();
@@ -1239,28 +1281,208 @@ async function contextoHorarios(emp, desde, hasta) {
 }
 
 const ESTADO_DIA = { presente: 'Presente', retraso: 'Retraso', anticipada: 'Salida anticipada', sin_salida: 'Sin salida',
-  falta: 'Falta', libre: 'Libre', feriado: 'Feriado', sin_horario: 'Sin horario', pendiente: 'Pendiente', antes_alta: 'Antes del ingreso' };
+  falta: 'Falta', media_falta: 'Falta de medio turno', libre: 'Libre', feriado: 'Feriado', sin_horario: 'Sin horario',
+  pendiente: 'Pendiente', antes_alta: 'Antes del ingreso' };
+const minutoAhora = () => { const a = ahoraBO(); return diaNum(a.slice(0, 10)) * 1440 + aMin(a.slice(11, 16)); };
 
-function evaluarDia(dia, j, { horario, turno, origen }, feriado, ahora, alta) {
-  const r = { horario: horario?.nombre || '', h_entrada: turno?.entrada || null, h_salida: turno?.salida || null,
-    h_minutos: turno ? aMinutos(turno.salida) - aMinutos(turno.entrada) : null, laboral: 0, retraso: 0, anticipada: 0, falta: 0 };
-  const sinSalida = j && !j.salida;
-  if (feriado) return { ...r, estado: 'feriado', obs: `Feriado: ${feriado}` };
-  if (!horario) return { ...r, estado: !j ? 'sin_horario' : sinSalida ? 'sin_salida' : 'presente',
-    obs: !j ? (origen === 'propio' ? 'Sin control de horario' : 'Sin horario asignado') : sinSalida ? 'Sin salida' : '' };
-  if (!turno) return { ...r, estado: 'libre', obs: j ? 'Día libre (marcó)' : 'Día libre' };
-  const hoy = ahora.slice(0, 10), hora = ahora.slice(11, 16);
-  if (!j && (dia > hoy || (dia === hoy && hora <= turno.limite_falta))) return { ...r, estado: 'pendiente', obs: '' };
-  if (!j && alta && dia < alta) return { ...r, estado: 'antes_alta', obs: `Antes de su ingreso (${fechaBO(alta)})` };
-  r.laboral = 1;
-  if (!j) return { ...r, falta: 1, estado: 'falta', obs: 'No marcó' };
-  if (j.entrada > turno.limite_falta) return { ...r, falta: 1, estado: 'falta', obs: `Llegó ${j.entrada}, después del límite de las ${turno.limite_falta}` };
-  const tarde = aMinutos(j.entrada) - aMinutos(turno.entrada);
-  if (tarde > horario.tolerancia) r.retraso = tarde;
-  if (j.salida) r.anticipada = Math.max(0, aMinutos(turno.salida) - aMinutos(j.salida));
+// Los turnos que le tocan a una persona del día d0 al d1 (números de día), cada uno con su ventana para marcar en
+// segundos, y a cuál va cada marcación: al turno cuya ventana la contiene (si hay dos, al más cercano). La que no cae
+// en ninguno queda suelta por fecha (día libre, sin horario o fuera del turno), salvo que el turno de ese día diga
+// "sumarlas como trabajadas": entonces va a él.
+function repartirMarcas(p, marcas, ctx, d0, d1) {
+  const turnos = [];
+  for (let n = d0; n <= d1; n++) {
+    const dia = numDia(n), v = ctx.de(p.empleado_id, p.empresa_id, dia);
+    if (!v.turno) continue;
+    const h = v.turno.h, b = n * 1440;
+    turnos.push({ dia, n, base: b, turno: v.turno, horario: v.horario, marcas: [],
+      ini: (b + h.eD) * 60, fin: (b + h.sH) * 60 + 59, E: (b + h.E) * 60, S: (b + h.S) * 60 });
+  }
+  const dist = (x, t) => t < x.E ? x.E - t : t > x.S ? t - x.S : 0;
+  const masCerca = (lista, t) => lista.reduce((a, x) => !a || dist(x, t) < dist(a, t) ? x : a, null);
+  const sueltas = new Map();
+  for (const m of marcas) {
+    let x = masCerca(turnos.filter(x => m.t >= x.ini && m.t <= x.fin), m.t);
+    if (!x) x = masCerca(turnos.filter(x => x.turno.fuera === 'trabajadas' &&
+      (m.dia === x.dia || (x.turno.h.S >= 1440 && diaNum(m.dia) === x.n + 1))), m.t);
+    if (x) { x.marcas.push(m); Object.assign(m, { turno: x.turno.nombre, turno_dia: x.dia }); }
+    else {
+      Object.assign(m, { turno: '', turno_dia: m.dia });
+      if (!sueltas.has(m.dia)) sueltas.set(m.dia, []);
+      sueltas.get(m.dia).push(m);
+    }
+  }
+  return { turnos, sueltas };
+}
+
+// Qué fue cada marcación por orden (entrada, descanso, salida…; las repetidas, como la que repiten), sin retraso ni falta
+function anotarPorOrden(marcas) {
+  estadosDelDia(marcas.map(m => m.t)).forEach((e, i) => Object.assign(marcas[i], e, { retraso: null, falta: 0 }));
+}
+// Lo marcado en una jornada (n: su día): entrada, salida, descanso por orden y horas
+function marcadoDe(marcas, n) {
+  if (!marcas.length) return { marcaciones: 0 };
+  const j = calcularJornada(marcas.map(m => m.t));
+  const ultima = marcas.reduce((u, m) => m.t - u.t >= REPETIDA_SEG ? m : u, marcas[0]);
+  return { ...j, salida_sig: !!j.salida && Math.floor(ultima.t / 86400) > n, marcaciones: marcas.length,
+    sucursal: marcas[0].sucursal, sucursal_id: marcas[0].sucursal_id };
+}
+
+// Una jornada con turno. ahora: minuto absoluto actual (lo que aún no pasó no es falta).
+function evaluarTurno(x, feriado, ahora, alta) {
+  const t = x.turno, h = t.h, b = x.base, marcas = x.marcas;
+  const r = { horario: x.horario?.nombre || '', turno: t.nombre, h_entrada: t.entrada, h_salida: t.salida, h_salida_sig: h.S >= 1440,
+    h_minutos: h.S - h.E - h.dur, laboral: 0, retraso: 0, anticipada: 0, falta: 0 };
+  if (feriado) { anotarPorOrden(marcas); return { ...marcadoDe(marcas, x.n), ...r, estado: 'feriado', obs: `Feriado: ${feriado}` }; }
+  if (!marcas.length) {
+    if (ahora <= b + h.L) return { marcaciones: 0, ...r, estado: 'pendiente', obs: '' };
+    if (alta && x.dia < alta) return { marcaciones: 0, ...r, estado: 'antes_alta', obs: `Antes de su ingreso (${fechaBO(alta)})` };
+    return { marcaciones: 0, ...r, laboral: t.vale, falta: t.vale, estado: 'falta', obs: 'No marcó' };
+  }
+  r.laboral = t.vale;
+  return h.dur ? evaluarPartido(x, r, ahora) : evaluarCorrido(x, r);
+}
+
+// Turno corrido: entrada = la primera, salida = la última. Llegar después del límite es falta del turno entero.
+function evaluarCorrido(x, r) {
+  const t = x.turno, h = t.h, b = x.base, marcado = marcadoDe(x.marcas, x.n), primera = x.marcas[0];
+  anotarPorOrden(x.marcas);
+  const ent = Math.floor(primera.t / 60);
+  if (ent > b + h.L) {
+    const obs = `Llegó ${hhmm(ent)}, después del límite de las ${t.limite_falta}`;
+    Object.assign(primera, { falta: t.vale, obs });
+    return { ...marcado, ...r, falta: t.vale, estado: 'falta', obs };
+  }
+  if (ent - (b + h.E) > t.tolerancia) r.retraso = ent - (b + h.E);
+  const sinSalida = !marcado.salida;
+  if (!sinSalida) {
+    const ultima = x.marcas.reduce((u, m) => m.t - u.t >= REPETIDA_SEG ? m : u, primera);
+    r.anticipada = Math.max(0, b + h.S - Math.floor(ultima.t / 60));
+  }
+  primera.retraso = r.retraso || null;
   const obs = [r.retraso ? `Retraso ${aHoras(r.retraso)}` : '', sinSalida ? 'Sin salida' : r.anticipada ? `Salió ${aHoras(r.anticipada)} antes` : '']
     .filter(Boolean).join(' · ');
-  return { ...r, estado: r.retraso ? 'retraso' : sinSalida ? 'sin_salida' : r.anticipada ? 'anticipada' : 'presente', obs };
+  return { ...marcado, ...r, estado: r.retraso ? 'retraso' : sinSalida ? 'sin_salida' : r.anticipada ? 'anticipada' : 'presente', obs };
+}
+
+// Turno con descanso flexible: 1.ª parte (entrada → salida a descanso) y 2.ª parte (regreso → salida); cada parte vale
+// la mitad del turno. Retraso al volver = lo que se pase de la duración del descanso. Volver después del límite, o
+// faltarle una marcación a una parte, es falta de esa parte. Si no marcó nada en el descanso, no hay falta: se le
+// descuenta la duración. Lo que todavía no pasó (hoy) no es falta.
+function evaluarPartido(x, r, ahora) {
+  const t = x.turno, h = t.h, b = x.base, marcas = x.marcas, medio = t.vale / 2, tol = t.tolerancia;
+  const E = b + h.E, L = b + h.L, S = b + h.S, dD = b + h.dD, dL = b + h.dL, dur = h.dur;
+  const K = [], de = marcas.map((m, i) => { if (!K.length || m.t - marcas[K[K.length - 1]].t >= REPETIDA_SEG) K.push(i); return K.length - 1; });
+  const sec = K.map(i => marcas[i].t), km = sec.map(s => Math.floor(s / 60)), paso = m => ahora > m;
+  let e1 = null, s1 = null, e2 = null, s2 = null, f1 = '', f2 = '', sinDescanso = false;
+  if (km[0] < dD) {
+    e1 = 0;
+    const resto = K.length - 1;
+    if (resto === 0) { if (paso(S)) { f1 = 'no marcó la salida a descanso'; f2 = 'no volvió del descanso'; } }
+    else if (resto === 1) {
+      if (km[1] >= dL) { s2 = 1; sinDescanso = true; }
+      else { s1 = 1; if (paso(dL)) f2 = 'no volvió del descanso'; }
+    } else if (resto === 2) {
+      if (km[2] < dL) { s1 = 1; e2 = 2; if (paso(S)) f2 = 'no marcó la salida'; }
+      else if (km[1] < (dD + dL) / 2) { s1 = 1; s2 = 2; f2 = 'no marcó el regreso del descanso'; }
+      else { e2 = 1; s2 = 2; f1 = 'no marcó la salida a descanso'; }
+    } else { s1 = 1; e2 = 2; s2 = K.length - 1; }
+  } else {
+    f1 = 'no vino'; e2 = 0;
+    if (K.length > 1) s2 = K.length - 1; else if (paso(S)) f2 = 'no marcó la salida';
+  }
+  let ret1 = 0, ret2 = 0, ant1 = 0, ant2 = 0;
+  if (e1 != null) {
+    if (km[e1] > L) f1 = f1 || `llegó ${hhmm(km[e1])}, después del límite de las ${t.limite_falta}`;
+    else if (km[e1] - E > tol) ret1 = km[e1] - E;
+  }
+  if (s1 != null && km[s1] < dD) ant1 = dD - km[s1];
+  if (e2 != null) {
+    if (km[e2] > dL) f2 = f2 || `${s1 != null ? 'volvió' : 'llegó'} ${hhmm(km[e2])}, después del límite de las ${t.descanso_limite}`;
+    else {
+      const exceso = s1 != null ? km[e2] - km[s1] - dur : km[e2] - (dD + dur);
+      if (exceso > tol) ret2 = exceso;
+    }
+  }
+  if (s2 != null) ant2 = Math.max(0, S - km[s2]);
+  if (f1) ret1 = ant1 = 0;
+  if (f2) ret2 = ant2 = 0;
+  const mins = (a, c) => Math.round((sec[c] - sec[a]) / 60);
+  let minutos;
+  if (sinDescanso) minutos = Math.max(0, mins(e1, s2) - dur);
+  else {
+    const p1 = e1 != null && s1 != null ? mins(e1, s1) : null, p2 = e2 != null && s2 != null ? mins(e2, s2) : null;
+    minutos = p1 == null && p2 == null ? null : (p1 || 0) + (p2 || 0);
+  }
+  // Cada marcación: qué fue; el retraso o la falta de cada parte va en su primera marcación
+  const papel = new Map([[e1, 'entrada'], [s1, 'descanso_ini'], [e2, s1 != null ? 'descanso_fin' : 'entrada'], [s2, 'salida']]);
+  marcas.forEach((m, i) => Object.assign(m, { estado: papel.get(de[i]) || 'intermedia', repetida: K[de[i]] !== i, retraso: null, falta: 0, obs: undefined }));
+  // Si una parte no tiene marcaciones, lo suyo va en la de la otra parte (así la fila suma la falta del día)
+  let k1 = e1 ?? s1, k2 = e2 ?? s2 ?? s1;
+  if (k1 == null) k1 = k2;
+  if (k2 == null) k2 = k1;
+  const marcar = (k, ret, f) => {
+    const m = marcas[K[k]];
+    m.retraso = (m.retraso || 0) + ret || null;
+    if (f) { m.falta += medio; m.obs = [m.obs, f[0].toUpperCase() + f.slice(1)].filter(Boolean).join(' · '); }
+  };
+  marcar(k1, ret1, f1);
+  marcar(k2, ret2, f2);
+  const falta = (f1 ? medio : 0) + (f2 ? medio : 0);
+  Object.assign(r, { retraso: ret1 + ret2, anticipada: ant1 + ant2, falta });
+  const ini = e1 ?? e2 ?? 0, conDescanso = s1 != null && e2 != null;
+  const obs = [f1 && `1.ª parte: ${f1}`, f2 && `2.ª parte: ${f2}`, ret1 && `Retraso ${aHoras(ret1)}`,
+    ret2 && `Retraso al volver del descanso ${aHoras(ret2)}`, ant1 && `Salió a descanso ${aHoras(ant1)} antes`,
+    ant2 && `Salió ${aHoras(ant2)} antes`, sinDescanso && `No marcó el descanso: se descontó ${aHoras(dur)}`].filter(Boolean).join(' · ');
+  return {
+    entrada: hhmm(km[ini]), salida: s2 != null ? hhmm(km[s2]) : null, salida_sig: s2 != null && Math.floor(sec[s2] / 86400) > x.n,
+    descanso_ini: s1 != null ? hhmm(km[s1]) : null, descanso_fin: conDescanso ? hhmm(km[e2]) : null,
+    descanso: conDescanso ? mins(s1, e2) : sinDescanso ? dur : null, almuerzo: conDescanso ? `${hhmm(km[s1])}–${hhmm(km[e2])}` : null,
+    total: s2 != null ? mins(ini, s2) : null, minutos, marcaciones: marcas.length, sucursal: marcas[0].sucursal, sucursal_id: marcas[0].sucursal_id,
+    ...r, estado: falta >= t.vale ? 'falta' : falta ? 'media_falta' : r.retraso ? 'retraso' : s2 == null ? 'sin_salida' : r.anticipada ? 'anticipada' : 'presente',
+    obs,
+  };
+}
+
+// Un día sin turno (libre o sin horario), con o sin marcaciones
+function evaluarSinTurno(dia, marcas, v, feriado) {
+  anotarPorOrden(marcas);
+  const marcado = marcadoDe(marcas, diaNum(dia)), j = marcas.length > 0, sinSalida = j && !marcado.salida;
+  const r = { horario: v.horario?.nombre || '', turno: '', h_entrada: null, h_salida: null, h_salida_sig: false, h_minutos: null,
+    laboral: 0, retraso: 0, anticipada: 0, falta: 0 };
+  if (feriado) return { ...marcado, ...r, estado: 'feriado', obs: `Feriado: ${feriado}` };
+  if (!v.horario) return { ...marcado, ...r, estado: !j ? 'sin_horario' : sinSalida ? 'sin_salida' : 'presente',
+    obs: !j ? (v.origen === 'propio' ? 'Sin control de horario' : 'Sin horario asignado') : sinSalida ? 'Sin salida' : '' };
+  return { ...marcado, ...r, estado: 'libre', obs: j ? 'Día libre (marcó)' : 'Día libre' };
+}
+
+// Una fila por día de [desde, hasta] para una persona, evaluada contra el turno de ese día (la jornada es del día en que
+// empieza el turno); de paso anota en cada marcación qué fue. suc: solo cuentan las jornadas que empezaron en esa
+// sucursal; las demás se ven como si no hubiera marcado.
+function diasPersona(p, marcas, ctx, desde, hasta, ahora, suc = null) {
+  const d0 = diaNum(desde), d1 = diaNum(hasta);
+  const { turnos, sueltas } = repartirMarcas(p, marcas, ctx, d0 - 1, d1 + 1);
+  const porDia = new Map(turnos.map(x => [x.dia, x]));
+  // Los turnos de los días de al lado se evalúan para anotar sus marcaciones que caen dentro del rango
+  for (const x of turnos) if (x.n < d0 || x.n > d1) evaluarTurno(x, ctx.feriado(p.empresa_id, x.dia), ahora, p.alta);
+  const dias = [];
+  for (let n = d0; n <= d1; n++) {
+    const dia = numDia(n), x = porDia.get(dia), feriado = ctx.feriado(p.empresa_id, dia);
+    let sueltasDia = sueltas.get(dia) || [], d;
+    if (x) {
+      const cuenta = !suc || !x.marcas.length || x.marcas[0].sucursal_id === suc;
+      d = evaluarTurno(cuenta ? x : { ...x, marcas: [] }, feriado, ahora, p.alta);
+      if (sueltasDia.length) {
+        sueltasDia.forEach(m => Object.assign(m, { estado: 'fuera', repetida: false, retraso: null, falta: 0 }));
+        d.obs = [d.obs, `Marcó fuera del turno: ${sueltasDia.map(m => m.hora.slice(0, 5)).join(', ')}`].filter(Boolean).join(' · ');
+      }
+    } else {
+      if (suc && sueltasDia.length && sueltasDia[0].sucursal_id !== suc) sueltasDia = [];
+      d = evaluarSinTurno(dia, sueltasDia, ctx.de(p.empleado_id, p.empresa_id, dia), feriado);
+    }
+    dias.push({ dia, ...d });
+  }
+  return dias;
 }
 
 function totalizar(dias) {
@@ -1277,41 +1499,39 @@ function totalizar(dias) {
   return t;
 }
 
-// Una hoja por persona con todos los días del rango. personas: los esperados; los PIN que marcaron sin estar
-// en el panel se agregan desde las jornadas.
-function armarHojas(personas, js, ctx, desde, hasta, incluir = () => true) {
-  const ahora = ahoraBO(), fechas = [];
-  for (let t = Date.parse(desde); t <= Date.parse(hasta); t += 864e5) fechas.push(new Date(t).toISOString().slice(0, 10));
-  const porClave = new Map(personas.map(p => [p.clave, { ...p, jornadas: new Map() }]));
-  for (const j of js) {
-    if (!porClave.has(j.clave)) porClave.set(j.clave, { clave: j.clave, empleado_id: j.empleado_id, empresa_id: j.empresa_id, empresa: j.empresa,
-      pin: j.pin, nombre: j.nombre, ci: j.ci, departamento: j.departamento, cargo: j.cargo, alta: j.alta, jornadas: new Map() });
-    porClave.get(j.clave).jornadas.set(j.dia, j);
+// Una hoja por persona con todos los días del rango. personas: los esperados; los que marcaron sin estar entre ellos
+// (PIN que no están en el panel, gente de otra sucursal) se agregan si tienen alguna jornada en el rango.
+// marcas: las de marcasCrudas, que quedan anotadas (qué fue cada una, su retraso o falta y su turno).
+function armarHojas(personas, marcas, ctx, desde, hasta, { incluir = () => true, suc = null } = {}) {
+  const ahora = minutoAhora();
+  const porClave = new Map(personas.map(p => [p.clave, { ...p, marcas: [] }]));
+  for (const m of marcas) {
+    if (!porClave.has(m.clave)) porClave.set(m.clave, { clave: m.clave, empleado_id: m.empleado_id, empresa_id: m.empresa_id, empresa: m.empresa,
+      pin: m.pin, nombre: m.nombre, ci: m.ci, departamento: m.departamento, cargo: m.cargo, alta: m.alta, marcas: [], extra: true });
+    porClave.get(m.clave).marcas.push(m);
   }
-  return [...porClave.values()].filter(incluir).sort(porNombre).map(({ jornadas, ...p }) => {
-    const dias = fechas.map(dia => {
-      const j = jornadas.get(dia);
-      const marcado = j ? { entrada: j.entrada, salida: j.salida, descanso_ini: j.descanso_ini, descanso_fin: j.descanso_fin, almuerzo: j.almuerzo,
-        descanso: j.descanso, total: j.total, minutos: j.minutos, marcaciones: j.marcaciones, sucursal: j.sucursal } : { marcaciones: 0 };
-      return { dia, ...marcado, ...evaluarDia(dia, j, ctx.de(p.empleado_id, p.empresa_id, dia), ctx.feriado(p.empresa_id, dia), ahora, p.alta) };
-    });
+  const hojas = [];
+  for (const { marcas: suyas, extra, ...p } of [...porClave.values()].filter(incluir).sort(porNombre)) {
+    const dias = diasPersona(p, suyas, ctx, desde, hasta, ahora, suc);
+    if (extra && !dias.some(d => d.marcaciones)) continue;
     const actual = ctx.de(p.empleado_id, p.empresa_id, hasta);
-    return { ...p, horario: actual.horario?.nombre || '', horario_propio: actual.origen === 'propio', dias, totales: totalizar(dias) };
-  });
+    hojas.push({ ...p, horario: actual.horario?.nombre || '', horario_propio: actual.origen === 'propio', dias, totales: totalizar(dias) });
+  }
+  return hojas;
 }
 
 // Personal filtrado: sucursal (selector de arriba), nombre/PIN/CI y departamento
 async function hojasFiltradas(req, desde, hasta) {
   const emp = empresaScope(req, req.query.empresa_id), suc = numId(req.query.sucursal_id);
   const buscar = clean(req.query.buscar).toLowerCase(), dep = clean(req.query.departamento);
-  const [personas, js, ctx] = await Promise.all([esperados(emp, suc), jornadas(emp, { desde, hasta, suc }), contextoHorarios(emp, desde, hasta)]);
+  const [personas, marcas, ctx] = await Promise.all([esperados(emp, suc), marcasCrudas(emp, desde, hasta), contextoHorarios(emp, desde, hasta)]);
   const incluir = p => (!buscar || [p.nombre, p.pin, p.ci].some(v => String(v || '').toLowerCase().includes(buscar))) && (!dep || p.departamento === dep);
   const departamentos = [...new Set(personas.map(p => p.departamento).filter(Boolean))].sort();
-  return { hojas: armarHojas(personas, js, ctx, desde, hasta, incluir), departamentos };
+  return { hojas: armarHojas(personas, marcas, ctx, desde, hasta, { incluir, suc }), departamentos };
 }
 
 // Hoja de asistencia en Excel, con las columnas de la hoja impresa
-const COLS_HOJA = [['Fecha', 11], ['Día', 10], ['Horario', 16], ['Entrada horario', 9], ['Salida horario', 9], ['Horas laborales', 9, 'horas'],
+const COLS_HOJA = [['Fecha', 11], ['Día', 10], ['Turno', 16], ['Entrada horario', 9], ['Salida horario', 11], ['Horas laborales', 9, 'horas'],
   ['Día laboral', 8], ['Entrada', 9], ['Salida', 9], ['Salida descanso', 9], ['Entrada descanso', 9], ['Horas descanso', 9, 'horas'],
   ['Total horas', 9, 'horas'], ['Horas trabajadas', 10, 'horas'], ['Retraso', 9, 'horas'], ['Salida anticipada', 10, 'horas'], ['Falta', 7],
   ['Observación', 34]];
@@ -1322,13 +1542,16 @@ const celdasPersona = (f, ec) => [f.pin, f.nombre || 'No registrado', f.ci, ...(
 // Encabezado de las hojas por persona en Excel
 const lineaPersona = h => `ID del empleado: ${h.pin}    Nombres: ${h.nombre || 'No registrado'}    CI: ${h.ci || '—'}    Departamento: ${h.departamento || '—'}` +
   `    Cargo: ${h.cargo || '—'}    Horario: ${h.horario || 'Sin horario'}${h.horario_propio ? ' (propio)' : h.horario ? ' (de la empresa)' : ''}`;
+// Una hora que es del día siguiente (salida de un turno de noche) lleva "(+1)"
+const masUno = (h, sig) => h && sig ? `${h} (+1)` : h;
 function hojaExcel(h, desde, hasta) {
   const t = h.totales;
   return {
     nombre: `${h.pin} ${h.nombre || 'No registrado'}`, horizontal: true, columnas: COLS_HOJA,
     encabezado: [[`Hoja de asistencia · ${h.empresa}`], [`Fecha inicial ${fechaBO(desde)}    Fecha final ${fechaBO(hasta)}`], [lineaPersona(h)]],
-    filas: [...h.dias.map(d => [fechaBO(d.dia), diaSem(d.dia), d.horario, d.h_entrada, d.h_salida, d.h_minutos, d.horario ? d.laboral : null,
-      d.entrada, d.salida, d.descanso_ini, d.descanso_fin, d.descanso, d.total, d.minutos, d.retraso || null, d.anticipada || null, d.falta || null, d.obs]),
+    filas: [...h.dias.map(d => [fechaBO(d.dia), diaSem(d.dia), d.turno, d.h_entrada, masUno(d.h_salida, d.h_salida_sig), d.h_minutos,
+      d.horario ? d.laboral : null, d.entrada, masUno(d.salida, d.salida_sig), d.descanso_ini, d.descanso_fin, d.descanso, d.total, d.minutos,
+      d.retraso || null, d.anticipada || null, d.falta || null, d.obs]),
     ['Totales', '', '', '', '', null, t.laborables, '', '', '', '', t.descanso, t.total, t.minutos, t.retraso, t.anticipada, t.faltas,
       `${t.dias} ${t.dias === 1 ? 'día trabajado' : 'días trabajados'} · ${t.retrasos} ${t.retrasos === 1 ? 'retraso' : 'retrasos'} · ${t.sin_salida} sin salida`]],
   };
@@ -1372,8 +1595,8 @@ app.get('/api/reportes/empleado', async (req, res) => {
         FROM empleados e JOIN empresas x ON x.id=e.empresa_id WHERE e.id=$1 AND ($2::int IS NULL OR e.empresa_id=$2)`, [empleado_id, emp])
     : await one(`SELECT 'p' || id || '-' || $2 clave, NULL::int empleado_id, id empresa_id, nombre empresa, $2::text pin FROM empresas WHERE id=$1`, [emp, pin]);
   if (!persona) throw new HttpError(404, 'El empleado no existe');
-  const [js, ctx] = await Promise.all([jornadas(emp, { desde, hasta, suc, empleado_id, pin }), contextoHorarios(emp, desde, hasta)]);
-  const [hoja] = armarHojas([persona], js, ctx, desde, hasta);
+  const [marcas, ctx] = await Promise.all([marcasCrudas(emp, desde, hasta, { empleado_id, pin }), contextoHorarios(emp, desde, hasta)]);
+  const [hoja] = armarHojas([persona], marcas, ctx, desde, hasta, { suc });
   if (req.query.formato === 'xlsx')
     return libroConMarcaciones(req, res, `asistencia_${persona.pin}_${desde}_${hasta}`, [hojaExcel(hoja, desde, hasta)], desde, hasta);
   res.json({ desde, hasta, hoja });
@@ -1390,10 +1613,12 @@ app.get('/api/reportes/sucursales', async (req, res) => {
     WHERE ($1::int IS NULL OR s.empresa_id=$1) AND ($2::int IS NULL OR s.id=$2)
     ORDER BY x.nombre, s.nombre`, [emp, suc]);
   const filas = new Map(rows.map(s => [s.sucursal_id, { ...s, asistieron: new Set(), jornadas: 0, marcaciones: 0, minutos: 0, sin_salida: 0 }]));
-  for (const j of await jornadas(emp, { desde, hasta, suc })) {
-    const f = filas.get(j.sucursal_id);
-    if (!f) continue; // equipo sin sucursal
-    f.asistieron.add(j.clave); f.jornadas++; f.marcaciones += j.marcaciones;
+  // Cada jornada cuenta en la sucursal donde marcó su entrada
+  const [marcas, ctx] = await Promise.all([marcasCrudas(emp, desde, hasta), contextoHorarios(emp, desde, hasta)]);
+  for (const h of armarHojas([], marcas, ctx, desde, hasta, { suc })) for (const j of h.dias) {
+    const f = j.marcaciones && filas.get(j.sucursal_id);
+    if (!f) continue; // sin marcaciones, o equipo sin sucursal
+    f.asistieron.add(h.clave); f.jornadas++; f.marcaciones += j.marcaciones;
     if (j.minutos == null) f.sin_salida++; else f.minutos += j.minutos;
   }
   const lista = [...filas.values()].map(f => ({ ...f, asistieron: f.asistieron.size }));
@@ -1422,7 +1647,7 @@ app.get('/api/reportes/fecha', async (req, res) => {
       columnas: [...COLS_PERSONA(ec), ['Sucursal', 18], ['Horario', 14], ['Entrada', 9], ['Descanso', 13], ['Salida', 9],
         ['Horas trabajadas', 10, 'horas'], ['Retraso', 9, 'horas'], ['Salida anticipada', 10, 'horas'], ['Falta', 7], ['Estado', 34]],
       filas: lista.map(f => [...celdasPersona(f, ec), f.sucursal,
-        f.h_entrada ? `${f.h_entrada}–${f.h_salida}` : f.horario, f.entrada, f.almuerzo, f.salida, f.minutos,
+        f.h_entrada ? `${f.h_entrada}–${masUno(f.h_salida, f.h_salida_sig)}` : f.horario, f.entrada, f.almuerzo, masUno(f.salida, f.salida_sig), f.minutos,
         f.retraso || null, f.anticipada || null, f.falta || null, ESTADO_DIA[f.estado] + (f.obs ? ` · ${f.obs}` : '')]) }], dia, dia);
   }
   res.json({ dia, totales, filas: lista });
@@ -1431,27 +1656,28 @@ app.get('/api/reportes/fecha', async (req, res) => {
 // Detalle de marcaciones: una fila por marcación. El reloj no dice si es entrada o salida (manda el estado 255),
 // así que cada una se nombra con la misma regla de las jornadas, para que coincida con las horas de los reportes.
 const ESTADO_MARC = { entrada: 'Entrada', salida: 'Salida', descanso_ini: 'Salida a descanso', descanso_fin: 'Regreso de descanso',
-  intermedia: 'Intermedia' };
+  intermedia: 'Intermedia', fuera: 'Fuera del turno' };
 const VERIFICACION = { 0: 'Clave', 1: 'Huella', 2: 'Tarjeta', 3: 'Clave', 4: 'Tarjeta', 15: 'Rostro', 25: 'Palma' };
 const MAX_MARC_PANTALLA = 3000; // en pantalla; el Excel las trae todas
 const plural = (n, uno, varios) => `${n} ${n === 1 ? uno : varios}`;
-// Columna "Retraso": minutos de retraso del día, o "Falta" si llegó después del límite
-const celdaRetraso = f => f.falta ? 'Falta' : f.retraso || null;
+const decimal = n => String(n).replace('.', ',');
+// Columna "Retraso": minutos de retraso, o "Falta" si esa marcación dejó falta (con lo que vale, si no es 1 día)
+const celdaRetraso = f => f.falta ? (f.falta === 1 ? 'Falta' : `Falta ${decimal(f.falta)}`) : f.retraso || null;
 const COLS_MARC_PERSONA = [['Fecha', 12, 'fecha'], ['Día', 7], ['Sucursal', 18], ['Dispositivo', 22], ['Hora marcación', 13, 'hora'],
-  ['Estado de marcación', 24], ['Retraso', 10, 'horas'], ['Método de verificación', 15]];
+  ['Estado de marcación', 24], ['Turno', 16], ['Retraso', 10, 'horas'], ['Método de verificación', 15]];
 
-// horas: las de una persona en un día, en orden. La que llega a menos de 2 min de la última que cuenta es repetida
-// y se nombra como esa. Con 3 que cuentan, la del medio no entra en el cálculo: es "intermedia".
-function estadosDelDia(horas) {
+// ts: segundos de las marcaciones de una jornada, en orden. La que llega a menos de 2 min de la última que cuenta es
+// repetida y se nombra como esa. Con 3 que cuentan, la del medio no entra en el cálculo: es "intermedia".
+function estadosDelDia(ts) {
   const cuentan = [];
-  const de = horas.map((h, i) => {
-    if (!cuentan.length || segHora(h) - segHora(horas[cuentan.at(-1)]) >= REPETIDA_SEG) cuentan.push(i);
+  const de = ts.map((s, i) => {
+    if (!cuentan.length || s - ts[cuentan.at(-1)] >= REPETIDA_SEG) cuentan.push(i);
     return cuentan.at(-1);
   });
   const n = cuentan.length, pos = new Map(cuentan.map((i, k) => [i, k]));
   const estado = k => k === 0 ? 'entrada' : k === n - 1 ? 'salida' :
     n >= 4 && k === 1 ? 'descanso_ini' : n >= 4 && k === 2 ? 'descanso_fin' : 'intermedia';
-  return horas.map((_, i) => ({ estado: estado(pos.get(de[i])), repetida: de[i] !== i }));
+  return ts.map((_, i) => ({ estado: estado(pos.get(de[i])), repetida: de[i] !== i }));
 }
 
 // Marcaciones del filtro, una fila por marcación, ordenadas por persona, fecha y hora. Filtros: empresa, sucursal,
@@ -1461,51 +1687,30 @@ async function marcacionesFiltradas(req, desde, hasta) {
   const emp = empresaScope(req, req.query.empresa_id), suc = numId(req.query.sucursal_id), dev = numId(req.query.dispositivo_id);
   const buscar = clean(req.query.buscar).toLowerCase(), dep = clean(req.query.departamento);
   const empId = numId(req.query.empleado_id), pinSuelto = empId ? null : clean(req.query.pin) || null;
-  const [{ rows }, ctx] = await Promise.all([q(`
-    SELECT d.empresa_id, x.nombre empresa, e.id empleado_id, COALESCE(e.pin, m.pin) pin, e.nombre, e.ci, e.departamento, e.cargo,
-      to_char(m.fecha, 'YYYY-MM-DD') dia, to_char(m.fecha, 'HH24:MI:SS') hora, m.verificacion,
-      d.id dispositivo_id, d.nombre dispositivo, d.sucursal_id, s.nombre sucursal
-    FROM marcaciones m
-    JOIN dispositivos d ON d.id=m.dispositivo_id
-    JOIN empresas x ON x.id=d.empresa_id
-    LEFT JOIN sucursales s ON s.id=d.sucursal_id
-    LEFT JOIN LATERAL (SELECT em.id, em.pin, em.nombre, em.ci, em.departamento, em.cargo FROM empleados em
-      WHERE em.empresa_id=d.empresa_id AND (em.pin=m.pin OR m.pin = ANY(em.pines_anteriores))
-      ORDER BY em.pin=m.pin DESC LIMIT 1) e ON TRUE
-    WHERE ($1::int IS NULL OR d.empresa_id=$1) AND m.fecha >= $2::date AND m.fecha < $3::date + 1
-    ORDER BY m.fecha, m.id`, [emp, desde, hasta]), contextoHorarios(emp, desde, hasta)]);
-  // El estado sale de todas las marcaciones de la persona ese día, en cualquier reloj; recién después se filtra
-  const dias = new Map(), ahora = ahoraBO();
-  for (const r of rows) {
-    r.clave = r.empleado_id ? `e${r.empleado_id}` : `p${r.empresa_id}-${r.pin}`;
-    const k = `${r.clave}|${r.dia}`;
-    if (!dias.has(k)) dias.set(k, []);
-    dias.get(k).push(r);
-  }
-  for (const lista of dias.values()) {
-    const horas = lista.map(r => r.hora), { empleado_id, empresa_id, dia } = lista[0];
-    estadosDelDia(horas).forEach(({ estado, repetida }, i) => Object.assign(lista[i], {
-      estado, repetida, estado_texto: ESTADO_MARC[estado] + (repetida ? ' (repetida)' : '') }));
-    // El retraso es del día, igual que en las hojas de asistencia: va en la fila de la entrada (la primera)
-    const ev = evaluarDia(dia, calcularJornada(horas), ctx.de(empleado_id, empresa_id, dia), ctx.feriado(empresa_id, dia), ahora, null);
-    Object.assign(lista[0], { retraso: ev.retraso || null, falta: ev.falta, ...(ev.falta ? { obs: ev.obs } : {}) });
-  }
-  const incluir = r => (!suc || r.sucursal_id === suc) && (!dev || r.dispositivo_id === dev) && (!dep || r.departamento === dep) &&
+  const [marcas, ctx] = await Promise.all([marcasCrudas(emp, desde, hasta), contextoHorarios(emp, desde, hasta)]);
+  // Cada persona se evalúa con todas sus marcaciones, en cualquier reloj: así cada una sabe qué fue, su turno y su
+  // retraso o falta (en la primera marcación de su parte del turno). Recién después se filtra.
+  armarHojas([], marcas, ctx, desde, hasta);
+  const incluir = r => r.dia >= desde && r.dia <= hasta && r.estado &&
+    (!suc || r.sucursal_id === suc) && (!dev || r.dispositivo_id === dev) && (!dep || r.departamento === dep) &&
     (!empId || r.empleado_id === empId) && (!pinSuelto || (!r.empleado_id && r.pin === pinSuelto)) &&
     (!buscar || [r.nombre, r.pin, r.ci].some(v => String(v || '').toLowerCase().includes(buscar)));
-  const filas = rows.filter(incluir)
-    .sort((a, b) => porNombre(a, b) || a.dia.localeCompare(b.dia) || a.hora.localeCompare(b.hora))
-    .map(({ verificacion, ...r }) => ({ ...r, metodo: VERIFICACION[verificacion] || (verificacion ? `Código ${verificacion}` : '') }));
+  const filas = marcas.filter(incluir)
+    .sort((a, b) => porNombre(a, b) || a.t - b.t)
+    .map(({ verificacion, t, alta, ...r }) => ({ ...r, estado_texto: ESTADO_MARC[r.estado] + (r.repetida ? ' (repetida)' : ''),
+      metodo: VERIFICACION[verificacion] || (verificacion ? `Código ${verificacion}` : '') }));
   return { filas, ctx, emp };
 }
 
+// Columna "Turno": su nombre y, si la marcación es de un turno que empezó otro día (la salida de uno de noche), ese día
+const turnoDe = f => f.turno ? f.turno + (f.turno_dia !== f.dia ? ` (del ${fechaBO(f.turno_dia)})` : '') : '';
 // Pestaña "Marcaciones" del Excel. ec: con columna Empresa (la plataforma con "Todas las empresas")
 function hojaMarcaciones(filas, ec) {
   return { nombre: 'Marcaciones', horizontal: true,
     columnas: [...COLS_PERSONA(ec), ['Fecha', 12, 'fecha'], ['Día', 7], ['Sucursal', 18], ['Dispositivo', 22], ['Hora marcación', 13, 'hora'],
-      ['Estado de marcación', 24], ['Retraso', 10, 'horas'], ['Método de verificación', 15]],
+      ['Estado de marcación', 24], ['Turno', 18], ['Retraso', 10, 'horas'], ['Método de verificación', 15]],
     filas: filas.map(f => [...celdasPersona(f, ec), f.dia, diaSem(f.dia).slice(0, 3), f.sucursal, f.dispositivo, f.hora,
-      f.estado_texto, celdaRetraso(f), f.metodo]) };
+      f.estado_texto, turnoDe(f), celdaRetraso(f), f.metodo]) };
 }
 // Los reportes con Excel le agregan la pestaña de marcaciones del mismo filtro
 async function libroConMarcaciones(req, res, archivo, hojas, desde, hasta) {
@@ -1542,17 +1747,17 @@ function marcacionesPorPersona(req, res, { desde, hasta, filas, hojas, ctx, depa
     grupos.get(f.clave).filas.push(f);
   }
   const lista = [...grupos.values()].sort(porNombre).map(g => ({ ...g, marcaciones: g.filas.length,
-    retraso: g.filas.reduce((a, f) => a + (f.retraso || 0), 0), retrasos: g.filas.filter(f => f.retraso).length }));
+    retraso: g.filas.reduce((a, f) => a + (f.retraso || 0), 0), retrasos: new Set(g.filas.filter(f => f.retraso).map(f => f.turno_dia)).size }));
   if (req.query.formato === 'xlsx') {
     if (!lista.length) throw new HttpError(404, 'No hay personal con esos filtros');
     return enviarLibro(res, `marcaciones_por_persona_${desde}_${hasta}`, lista.map(g => ({
       nombre: `${g.pin} ${g.nombre || 'No registrado'}`, horizontal: true, columnas: COLS_MARC_PERSONA,
       encabezado: [[`Detalle de marcaciones · ${g.empresa}`], [`Fecha inicial ${fechaBO(desde)}    Fecha final ${fechaBO(hasta)}`], [lineaPersona(g)],
         [`${plural(g.marcaciones, 'marcación', 'marcaciones')}    Retraso total: ${aHoras(g.retraso)} (${plural(g.retrasos, 'retraso', 'retrasos')})` +
-          `    Faltas en el período: ${g.faltas}`]],
-      filas: [...g.filas.map(f => [f.dia, diaSem(f.dia).slice(0, 3), f.sucursal, f.dispositivo, f.hora, f.estado_texto, celdaRetraso(f), f.metodo]),
-        ['Totales', null, null, null, plural(g.marcaciones, 'marcación', 'marcaciones'), plural(g.retrasos, 'retraso', 'retrasos'), g.retraso,
-          plural(g.faltas, 'falta', 'faltas')]],
+          `    Faltas en el período: ${decimal(g.faltas)}`]],
+      filas: [...g.filas.map(f => [f.dia, diaSem(f.dia).slice(0, 3), f.sucursal, f.dispositivo, f.hora, f.estado_texto, turnoDe(f), celdaRetraso(f), f.metodo]),
+        ['Totales', null, null, null, plural(g.marcaciones, 'marcación', 'marcaciones'), plural(g.retrasos, 'retraso', 'retrasos'), null, g.retraso,
+          `${decimal(g.faltas)} ${g.faltas === 1 ? 'falta' : 'faltas'}`]],
     })));
   }
   // En pantalla, personas enteras hasta llegar al máximo de filas
@@ -1572,17 +1777,108 @@ async function enTransaccion(fn) {
   try { await c.query('BEGIN'); const r = await fn(c); await c.query('COMMIT'); return r; }
   catch (e) { await c.query('ROLLBACK'); throw e; } finally { c.release(); }
 }
+// ---- Turnos (catálogo de cada empresa) ----
+const COLORES_TURNO = ['teal', 'blue', 'orange', 'purple', 'gray'];
+const HORA_RE = /^([01]\d|2[0-3]):[0-5]\d$/;
+// Duración "1:30" o en minutos ("90")
+const duracionMin = v => {
+  const s = clean(v), m = /^(\d{1,2}):([0-5]\d)$/.exec(s);
+  return m ? Number(m[1]) * 60 + Number(m[2]) : /^\d+$/.test(s) ? Number(s) : NaN;
+};
+function datosTurno(b) {
+  const hhmm = v => clean(v).slice(0, 5);
+  const t = { nombre: clean(b.nombre), color: COLORES_TURNO.includes(b.color) ? b.color : 'teal', vale: Number(String(b.vale ?? 1).replace(',', '.')),
+    entrada: hhmm(b.entrada), salida: hhmm(b.salida), limite_falta: hhmm(b.limite_falta), marca_desde: hhmm(b.marca_desde),
+    marca_hasta: hhmm(b.marca_hasta), tolerancia: Number(b.tolerancia ?? 0), fuera: b.fuera === 'trabajadas' ? 'trabajadas' : 'sin_turno',
+    descanso_desde: null, descanso_min: null, descanso_limite: null };
+  if (!t.nombre) throw new HttpError(400, 'Ponle un nombre al turno');
+  if (![0.5, 1, 1.5, 2].includes(t.vale)) throw new HttpError(400, '"Vale como" puede ser 0,5, 1, 1,5 o 2 días');
+  if (!Number.isInteger(t.tolerancia) || t.tolerancia < 0 || t.tolerancia > 240) throw new HttpError(400, 'La tolerancia va de 0 a 240 minutos');
+  for (const [k, nom] of [['entrada', 'la hora de entrada'], ['limite_falta', 'la hora de falta'], ['marca_desde', 'desde cuándo acepta marcar'],
+    ['salida', 'la hora de salida'], ['marca_hasta', 'hasta cuándo acepta marcar']])
+    if (!HORA_RE.test(t[k])) throw new HttpError(400, `Completa ${nom}`);
+  if (b.descanso) {
+    Object.assign(t, { descanso_desde: hhmm(b.descanso_desde), descanso_min: duracionMin(b.descanso_min), descanso_limite: hhmm(b.descanso_limite) });
+    if (!HORA_RE.test(t.descanso_desde) || !HORA_RE.test(t.descanso_limite)) throw new HttpError(400, 'Descanso: completa las horas');
+    if (!Number.isInteger(t.descanso_min) || t.descanso_min < 1 || t.descanso_min > 600)
+      throw new HttpError(400, 'Descanso: la duración va de 0:01 a 10:00 (horas:minutos)');
+  }
+  const h = horasTurno(t);
+  if (h.S - h.E < 30) throw new HttpError(400, 'El turno debe durar al menos 30 minutos');
+  if (!(h.E < h.L && h.L < h.S)) throw new HttpError(400, 'La hora de falta debe quedar entre la entrada y la salida');
+  if (h.E - h.eD > 720) throw new HttpError(400, '"Acepta la marcación desde" puede ser como mucho 12 horas antes de la entrada');
+  if (h.sH - h.S > 720) throw new HttpError(400, '"Acepta la marcación hasta" puede ser como mucho 12 horas después de la salida');
+  if (t.descanso_min) {
+    if (!(h.L < h.dD)) throw new HttpError(400, 'El descanso debe empezar después de la hora de falta de la entrada');
+    if (!(h.dD + h.dur < h.S)) throw new HttpError(400, 'El descanso debe terminar antes de la salida');
+    if (!(h.dD < h.dL && h.dL < h.S)) throw new HttpError(400, 'La hora de falta de la 2.ª parte debe quedar entre "puede salir desde" y la salida');
+  }
+  return t;
+}
+async function turnoPropio(req, id) {
+  const t = await one(`SELECT * FROM turnos WHERE id=$1`, [id]);
+  if (!t) throw new HttpError(404, 'El turno no existe');
+  checkEmpresa(req, t.empresa_id);
+  return t;
+}
+async function nombreTurnoLibre(empresa_id, nombre, id = 0) {
+  if (await one(`SELECT 1 FROM turnos WHERE empresa_id=$1 AND lower(nombre)=lower($2) AND id<>$3`, [empresa_id, nombre, id]))
+    throw new HttpError(409, `Ya hay un turno llamado "${nombre}"`);
+}
+const CAMPOS_TURNO = ['nombre', 'color', 'vale', 'entrada', 'salida', 'limite_falta', 'marca_desde', 'marca_hasta', 'tolerancia',
+  'descanso_desde', 'descanso_min', 'descanso_limite', 'fuera'];
+
+app.get('/api/turnos', async (req, res) => {
+  const emp = empresaScope(req, req.query.empresa_id);
+  const { rows } = await q(`SELECT ${TURNO_COLS}, x.nombre empresa,
+      COALESCE((SELECT json_agg(DISTINCT h.nombre) FROM horario_dias d JOIN horarios h ON h.id=d.horario_id WHERE d.turno_id=t.id), '[]') horarios
+    FROM turnos t JOIN empresas x ON x.id=t.empresa_id WHERE ($1::int IS NULL OR t.empresa_id=$1) ORDER BY x.nombre, t.entrada, t.nombre`, [emp]);
+  res.json(rows);
+});
+app.post('/api/turnos', async (req, res) => {
+  soloEditor(req);
+  const empresa_id = isAdmin(req) ? numId(req.body.empresa_id) : req.user.empresa_id;
+  if (!empresa_id) throw new HttpError(400, 'Elige la empresa');
+  const t = datosTurno(req.body);
+  await nombreTurnoLibre(empresa_id, t.nombre);
+  res.json(await one(`INSERT INTO turnos (empresa_id, ${CAMPOS_TURNO}) VALUES ($1, ${CAMPOS_TURNO.map((_, i) => '$' + (i + 2))})
+    RETURNING id, empresa_id, nombre`, [empresa_id, ...CAMPOS_TURNO.map(k => t[k])]));
+});
+// Ojo: cambiar un turno también cambia los reportes de fechas pasadas de quienes lo tenían
+app.put('/api/turnos/:id', async (req, res) => {
+  soloEditor(req);
+  const actual = await turnoPropio(req, req.params.id), t = datosTurno(req.body);
+  await nombreTurnoLibre(actual.empresa_id, t.nombre, actual.id);
+  await q(`UPDATE turnos SET ${CAMPOS_TURNO.map((k, i) => `${k}=$${i + 2}`)} WHERE id=$1`, [actual.id, ...CAMPOS_TURNO.map(k => t[k])]);
+  res.json({ ok: true });
+});
+app.delete('/api/turnos/:id', async (req, res) => {
+  soloEditor(req);
+  const t = await turnoPropio(req, req.params.id);
+  const { rows } = await q(`SELECT DISTINCT h.nombre FROM horario_dias d JOIN horarios h ON h.id=d.horario_id WHERE d.turno_id=$1`, [t.id]);
+  if (rows.length) throw new HttpError(409, `Este turno se usa en ${rows.length === 1 ? 'el horario' : 'los horarios'} ` +
+    `${rows.map(r => `"${r.nombre}"`).join(', ')}. Quítalo de ahí antes de eliminarlo.`);
+  await q(`DELETE FROM turnos WHERE id=$1`, [t.id]);
+  res.json({ ok: true });
+});
+
+// ---- Horarios semanales: qué turno toca cada día ----
+// dias: [{ dia, turno_id }]. También se aceptan las horas por día de la versión anterior ({ dia, entrada, salida,
+// limite_falta }): se convierten en turnos, como al actualizar el panel.
 function datosHorario(b) {
   const nombre = clean(b.nombre), tolerancia = Number(b.tolerancia || 0), hhmm = v => clean(v).slice(0, 5);
   if (!nombre) throw new HttpError(400, 'Ponle un nombre al horario');
   if (!Number.isInteger(tolerancia) || tolerancia < 0 || tolerancia > 240) throw new HttpError(400, 'La tolerancia va de 0 a 240 minutos');
-  const dias = [].concat(b.dias || []).map(d => ({ dia: Number(d.dia), entrada: hhmm(d.entrada), salida: hhmm(d.salida), limite_falta: hhmm(d.limite_falta) }));
-  if (!dias.length) throw new HttpError(400, 'Marca al menos un día de trabajo');
+  const dias = [].concat(b.dias || []).map(d => d.turno_id != null
+    ? { dia: Number(d.dia), turno_id: numId(d.turno_id) }
+    : { dia: Number(d.dia), entrada: hhmm(d.entrada), salida: hhmm(d.salida), limite_falta: hhmm(d.limite_falta) });
+  if (!dias.length) throw new HttpError(400, 'Elige el turno de al menos un día');
   if (new Set(dias.map(d => d.dia)).size !== dias.length) throw new HttpError(400, 'Hay un día repetido');
   for (const d of dias) {
     const nom = DIA_SEM[d.dia];
     if (!Number.isInteger(d.dia) || !nom) throw new HttpError(400, 'Día no válido');
-    if (![d.entrada, d.salida, d.limite_falta].every(h => /^([01]\d|2[0-3]):[0-5]\d$/.test(h))) throw new HttpError(400, `${nom}: completa las horas`);
+    if ('turno_id' in d) { if (!d.turno_id) throw new HttpError(400, `${nom}: elige el turno`); continue; }
+    if (![d.entrada, d.salida, d.limite_falta].every(h => HORA_RE.test(h))) throw new HttpError(400, `${nom}: completa las horas`);
     if (!(d.entrada < d.limite_falta && d.limite_falta < d.salida))
       throw new HttpError(400, `${nom}: la hora de falta debe quedar entre la entrada y la salida`);
   }
@@ -1592,10 +1888,68 @@ async function nombreHorarioLibre(empresa_id, nombre, id = 0) {
   if (await one(`SELECT 1 FROM horarios WHERE empresa_id=$1 AND lower(nombre)=lower($2) AND id<>$3`, [empresa_id, nombre, id]))
     throw new HttpError(409, `Ya hay un horario llamado "${nombre}"`);
 }
-async function guardarDias(c, horario_id, dias) {
-  await c.query(`DELETE FROM horario_dias WHERE horario_id=$1`, [horario_id]);
-  for (const d of dias) await c.query(`INSERT INTO horario_dias (horario_id, dia, entrada, salida, limite_falta) VALUES ($1,$2,$3,$4,$5)`,
-    [horario_id, d.dia, d.entrada, d.salida, d.limite_falta]);
+// "lu–vi", "sá", "lu, mi": los días de un grupo, de lunes a domingo
+const DIA_ABR = ['do', 'lu', 'ma', 'mi', 'ju', 'vi', 'sá'], SEMANA = [1, 2, 3, 4, 5, 6, 0];
+function nombreDias(dias) {
+  const grupos = [];
+  for (const d of SEMANA.filter(x => dias.includes(x))) {
+    const g = grupos.at(-1);
+    if (g && SEMANA.indexOf(g.at(-1)) === SEMANA.indexOf(d) - 1) g.push(d); else grupos.push([d]);
+  }
+  return grupos.map(g => g.length > 2 ? `${DIA_ABR[g[0]]}–${DIA_ABR[g.at(-1)]}` : g.map(d => DIA_ABR[d]).join(', ')).join(', ');
+}
+// Horas por día (versión anterior) → turnos: uno por cada juego de horas distinto, que acepta marcar todo el día
+// (así las marcaciones se agrupan por fecha, como antes). Si ya hay un turno igual en la empresa, se usa ese.
+async function turnosDeHoras(c, empresa_id, nombreHorario, tolerancia, dias) {
+  const grupos = new Map();
+  for (const d of dias) {
+    const k = `${d.entrada}|${d.salida}|${d.limite_falta}`;
+    if (!grupos.has(k)) grupos.set(k, []);
+    grupos.get(k).push(d);
+  }
+  const res = [];
+  for (const g of grupos.values()) {
+    const { entrada, salida, limite_falta } = g[0];
+    let id = (await c.query(`SELECT id FROM turnos WHERE empresa_id=$1 AND entrada=$2 AND salida=$3 AND limite_falta=$4 AND tolerancia=$5
+      AND marca_desde='00:00' AND marca_hasta='23:59' AND descanso_min IS NULL AND vale=1 AND fuera='sin_turno' ORDER BY id LIMIT 1`,
+      [empresa_id, entrada, salida, limite_falta, tolerancia])).rows[0]?.id;
+    if (!id) {
+      const base = grupos.size > 1 ? `${nombreHorario} (${nombreDias(g.map(d => d.dia))})` : nombreHorario;
+      let nombre = base;
+      for (let i = 2; (await c.query(`SELECT 1 FROM turnos WHERE empresa_id=$1 AND lower(nombre)=lower($2)`, [empresa_id, nombre])).rowCount; i++)
+        nombre = `${base} ${i}`;
+      id = (await c.query(`INSERT INTO turnos (empresa_id, nombre, entrada, salida, limite_falta, marca_desde, marca_hasta, tolerancia)
+        VALUES ($1,$2,$3,$4,$5,'00:00','23:59',$6) RETURNING id`, [empresa_id, nombre, entrada, salida, limite_falta, tolerancia])).rows[0].id;
+    }
+    for (const d of g) res.push({ dia: d.dia, turno_id: id });
+  }
+  return res;
+}
+async function guardarDias(c, h, dias) {
+  const conHoras = dias.filter(d => !('turno_id' in d));
+  const todos = [...dias.filter(d => 'turno_id' in d), ...(conHoras.length ? await turnosDeHoras(c, h.empresa_id, h.nombre, h.tolerancia, conHoras) : [])];
+  const ids = [...new Set(todos.map(d => d.turno_id))];
+  const { rows } = await c.query(`SELECT id FROM turnos WHERE id = ANY($1) AND empresa_id=$2`, [ids, h.empresa_id]);
+  if (rows.length !== ids.length) throw new HttpError(400, 'Hay un turno que no existe o es de otra empresa');
+  await c.query(`DELETE FROM horario_dias WHERE horario_id=$1`, [h.id]);
+  for (const d of todos) await c.query(`INSERT INTO horario_dias (horario_id, dia, turno_id) VALUES ($1,$2,$3)`, [h.id, d.dia, d.turno_id]);
+}
+// Al arrancar: los horarios de la versión anterior (horas por día, sin turno) pasan a usar turnos. Los reportes no cambian.
+async function migrarHorariosATurnos() {
+  const { rows } = await q(`SELECT d.horario_id, d.dia, to_char(d.entrada,'HH24:MI') entrada, to_char(d.salida,'HH24:MI') salida,
+      to_char(d.limite_falta,'HH24:MI') limite_falta, h.empresa_id, h.nombre, h.tolerancia
+    FROM horario_dias d JOIN horarios h ON h.id=d.horario_id WHERE d.turno_id IS NULL AND d.entrada IS NOT NULL ORDER BY d.horario_id, d.dia`);
+  if (!rows.length) return;
+  const porHorario = new Map();
+  for (const r of rows) { if (!porHorario.has(r.horario_id)) porHorario.set(r.horario_id, []); porHorario.get(r.horario_id).push(r); }
+  await enTransaccion(async c => {
+    for (const [horario_id, dias] of porHorario) {
+      const { empresa_id, nombre, tolerancia } = dias[0];
+      for (const d of await turnosDeHoras(c, empresa_id, nombre, tolerancia, dias))
+        await c.query(`UPDATE horario_dias SET turno_id=$3 WHERE horario_id=$1 AND dia=$2`, [horario_id, d.dia, d.turno_id]);
+    }
+  });
+  log(`🔁 ${porHorario.size} horario(s) pasaron a usar turnos (sus reportes no cambian)`);
 }
 async function horarioPropio(req, id) {
   const h = await one(`SELECT * FROM horarios WHERE id=$1`, [id]);
@@ -1608,8 +1962,9 @@ app.get('/api/horarios', async (req, res) => {
   const emp = empresaScope(req, req.query.empresa_id);
   const { rows } = await q(`
     SELECT h.id, h.empresa_id, x.nombre empresa, h.nombre, h.tolerancia,
-      COALESCE((SELECT json_agg(json_build_object('dia', d.dia, 'entrada', to_char(d.entrada,'HH24:MI'), 'salida', to_char(d.salida,'HH24:MI'),
-          'limite_falta', to_char(d.limite_falta,'HH24:MI')) ORDER BY d.dia) FROM horario_dias d WHERE d.horario_id=h.id), '[]') dias,
+      COALESCE((SELECT json_agg(json_build_object('dia', d.dia, 'turno_id', t.id, 'turno', t.nombre, 'color', t.color,
+          'entrada', to_char(t.entrada,'HH24:MI'), 'salida', to_char(t.salida,'HH24:MI'), 'limite_falta', to_char(t.limite_falta,'HH24:MI')) ORDER BY d.dia)
+        FROM horario_dias d JOIN turnos t ON t.id=d.turno_id WHERE d.horario_id=h.id), '[]') dias,
       (SELECT count(*)::int FROM empleados e WHERE e.empresa_id=h.empresa_id AND e.activo
          AND horario_vigente(e.id, (now() AT TIME ZONE 'America/La_Paz')::date) = h.id) empleados,
       COALESCE((SELECT eh.horario_id FROM empresa_horario eh WHERE eh.empresa_id=h.empresa_id
@@ -1658,7 +2013,7 @@ app.post('/api/horarios', async (req, res) => {
   await nombreHorarioLibre(empresa_id, nombre);
   res.json(await enTransaccion(async c => {
     const h = (await c.query(`INSERT INTO horarios (empresa_id, nombre, tolerancia) VALUES ($1,$2,$3) RETURNING *`, [empresa_id, nombre, tolerancia])).rows[0];
-    await guardarDias(c, h.id, dias);
+    await guardarDias(c, h, dias);
     return h;
   }));
 });
@@ -1670,7 +2025,7 @@ app.put('/api/horarios/:id', async (req, res) => {
   await nombreHorarioLibre(h.empresa_id, nombre, h.id);
   res.json(await enTransaccion(async c => {
     await c.query(`UPDATE horarios SET nombre=$2, tolerancia=$3 WHERE id=$1`, [h.id, nombre, tolerancia]);
-    await guardarDias(c, h.id, dias);
+    await guardarDias(c, { ...h, nombre, tolerancia }, dias);
     return { ok: true };
   }));
 });

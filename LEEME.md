@@ -57,7 +57,14 @@ Un acceso de empresa no puede entrar por `/admin` ni el tuyo por `/clientes`. La
 5. **Usuarios del reloj** (en Dispositivos): lee los usuarios que ya existen en el equipo (PIN, nombre, tarjeta, privilegio, clave, rostro/huella) y los muestra en una bandeja. Desde ahí puedes **Descargar Excel** y **Agregar al panel** los que marques. Los usuarios que se registren después directamente en el reloj también llegan a esta bandeja como "Nuevos" (el botón muestra cuántos hay).
 6. **Empleados**: crea el empleado y marca en qué equipos debe existir. Se envía solo en unos 10 segundos. El chip cambia de "Pendiente" (naranja) a "Sincronizado" (verde).
 7. Registra el rostro en el equipo: Gestión de usuarios → editar → Rostro.
-8. **Horarios**: crea el horario (por ejemplo, "Oficina": lunes a viernes 08:00–18:00, sábado 08:00–12:00, tolerancia 10 minutos, falta después de las 10:00) y ponlo como **horario principal** de la empresa desde una fecha. El principal se aplica solo a todo el personal de la empresa, también a los empleados nuevos. Si la empresa cambia de horario, pulsa "Cambiar" y elige desde cuándo: los días anteriores no se alteran.
+8. **Horarios**: primero crea los **turnos** y después el **horario semanal** que los usa.
+   - **Turno** ("+ Nuevo turno"): entrada, salida, tolerancia, hasta qué hora se llega sin falta, entre qué horas se acepta marcar, cuánto vale (1 día, 0,5…) y su color.
+     - Si la salida es menor que la entrada, el turno termina al día siguiente (por ejemplo, 22:00 a 06:00) y cuenta para el día en que empieza.
+     - En la pestaña **Descanso** se configura un descanso flexible: desde qué hora puede salir, cuánto dura y hasta qué hora puede volver.
+     - En **Fuera del turno** se decide qué hacer con las marcaciones que no caen en las horas en que el turno acepta marcar.
+   - **Horario semanal** ("+ Nuevo horario"): qué turno toca cada día (los demás días son libres). Si falta un turno, "+ Nuevo turno" lo crea sin perder lo escrito.
+   - Pon el horario como **horario principal** de la empresa desde una fecha. El principal se aplica solo a todo el personal de la empresa, también a los empleados nuevos. Si la empresa cambia de horario, pulsa "Cambiar" y elige desde cuándo: los días anteriores no se alteran.
+   - Los horarios creados antes de los turnos se convirtieron solos en turnos que aceptan marcar todo el día: sus reportes no cambiaron.
    - **Excepciones**: en **Empleados**, marca a quien trabaja distinto y pulsa **Horario propio**. Puedes darle otro horario, dejarlo "sin control de horario" (por ejemplo, gerencia) o devolverlo al de la empresa.
    - En la misma pantalla de Horarios se cargan los **feriados**: los nacionales los cargas tú desde `/admin`, y cada empresa puede agregar los suyos.
 9. **Reportes → Por empleados**: filtra por sucursal, nombre/PIN/CI o departamento. Con un clic en una persona ves su **hoja de asistencia**. "Imprimir hojas" saca una hoja horizontal por cada persona de la lista, y "Hojas en Excel" genera un Excel con una pestaña por persona.
@@ -70,10 +77,26 @@ Un acceso de empresa no puede entrar por `/admin` ni el tuyo por `/clientes`. La
 **Cómo se calcula con el horario:**
 - **Entrada y salida**: la primera marcación del día es la entrada y la última la salida. Con 4 o más, la 2.ª y la 3.ª son la salida y el regreso del descanso, que se descuenta de las horas. Con 3, la del medio no se usa. Una marcación a menos de 2 minutos de la anterior es repetida y cuenta como una.
 - **Retraso**: si llega después de la entrada más la tolerancia, se cuentan los minutos desde la hora de entrada. Por ejemplo, con entrada 08:00 y tolerancia de 10 minutos: llegar a las 08:08 no cuenta retraso, y llegar a las 08:15 cuenta 0:15.
-- **Falta**: llegar después de la hora de falta (por ejemplo, 10:00), o no marcar en un día de trabajo, cuenta 1 día de falta.
-- **Salida anticipada**: los minutos antes de la salida del horario.
+- **Falta**: llegar después de la hora de falta (por ejemplo, 10:00), o no marcar en un día de trabajo, es falta por lo que vale el turno (normalmente 1 día).
+- **Turno con descanso**: cada parte (antes y después del descanso) vale la mitad del turno.
+  - Volver del descanso pasado lo permitido es retraso.
+  - Volver después de la hora de falta de la 2.ª parte, o no marcar la salida o el regreso, es falta de esa parte (0,5).
+  - Si no marca nada en el descanso, no hay falta: se descuenta la duración del descanso.
+- **Salida anticipada**: los minutos antes de la salida del turno.
 - **Días que no cuentan falta**: los días libres, los feriados, los días sin horario (antes de que la empresa tuviera horario principal) y los días que aún no pasaron.
-- Si editas un horario, cambian también los reportes pasados de quienes lo tienen. Para un cambio a partir de una fecha, crea un horario nuevo y ponlo como principal (o como horario propio) desde esa fecha.
+- Si editas un turno o un horario, cambian también los reportes pasados de quienes lo tienen. Para un cambio a partir de una fecha, crea un horario nuevo y ponlo como principal (o como horario propio) desde esa fecha.
+
+## Respaldos de la base
+Guía completa, con todos los comandos y qué hacer en cada caso de recuperación: [scripts/LEEME-RESPALDOS.md](scripts/LEEME-RESPALDOS.md).
+
+- **Automático**: la tarea de Windows "BioPanel - respaldo diario" corre todos los días a las 23:30 (si la PC estaba apagada, apenas se enciende). Hace una copia completa y cifrada en `OneDrive\Respaldos BioPanel`, así también sube a la nube.
+- **Qué se guarda**: los últimos 14 días, una copia por semana de las últimas 8 semanas y el cierre (último respaldo) de cada uno de los últimos 24 meses. Lo más viejo se borra solo.
+- **Cada copia se comprueba**: antes de darla por buena se descifra y se verifica que PostgreSQL pueda leerla. El resultado de cada respaldo queda en `respaldos.log`, en la misma carpeta.
+- **La clave de cifrado** está en `C:\Users\<tu usuario>\.biopanel\respaldo.key`, a propósito fuera de OneDrive. **Guarda una copia en un USB o en un gestor de contraseñas**: si la PC se daña, sin esa clave los respaldos no se pueden abrir.
+- **A mano**: `node scripts/respaldo.js` (por ejemplo, antes de actualizar el panel).
+- **Probar que sirven (una vez al mes)**: `node scripts/restaurar.js --probar`. Restaura el último respaldo en una base aparte, muestra cuántas empresas, empleados y marcaciones tiene, y la borra.
+- **Recuperar datos**: `node scripts/restaurar.js "<archivo .dump.enc>"`. Crea una base **nueva** (`senseface_restaurada_<fecha>`) y nunca toca la que está en uso. Para usarla, cambia `DATABASE_URL` a esa base.
+- Los relojes también guardan sus marcaciones: si se perdieran datos de días recientes, "Traer marcaciones" (en Dispositivos) los vuelve a descargar. No borres el registro de marcaciones desde el menú del reloj.
 
 ## Seguridad del inicio de sesión
 - **5 contraseñas incorrectas seguidas** bloquean esa cuenta **15 minutos**, en `/admin` y en `/clientes`. El mensaje avisa cuántos intentos quedan.

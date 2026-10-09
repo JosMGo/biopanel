@@ -380,7 +380,7 @@ const tdPersona = f => `<td class="num">${esc(f.pin)}</td><td>${f.nombre ? `<b>$
   <td>${esc(f.ci)}</td>${repEmpCol() ? `<td>${esc(f.empresa)}</td>` : ''}<td>${esc(f.departamento)}</td><td>${esc(f.cargo)}</td>`;
 const ESTADO_REP = { presente: ['ok', 'Presente'], retraso: ['warn', 'Retraso'], anticipada: ['warn', 'Salida anticipada'],
   sin_salida: ['warn', 'Sin salida'], falta: ['err', 'Falta'], libre: ['', 'Libre'], feriado: ['acc', 'Feriado'],
-  sin_horario: ['', 'Sin horario'], pendiente: ['', 'Pendiente'], antes_alta: ['', 'Antes del ingreso'] };
+  sin_horario: ['', 'Sin horario'], pendiente: ['', 'Pendiente'], antes_alta: ['', 'Antes del ingreso'], media_falta: ['err', 'Falta ½ turno'] };
 const estadoBadge = e => { const [c, t] = ESTADO_REP[e] || ['', e]; return `<span class="badge ${c}">${t}</span>`; };
 
 function repBarra(campos, volver = '') {
@@ -439,12 +439,12 @@ function repTablaEmpleados(titulo, filas, clic) {
       <td class="num">${f.dias}${f.laborables ? `<span class="hint"> / ${f.laborables}</span>` : ''}</td><td class="num">${f.dias ? hm(f.minutos) : ''}</td>
       <td class="num">${f.retrasos ? `<b class="t-warn">${hm(f.retraso)}</b> <span class="hint">(${f.retrasos} ${f.retrasos === 1 ? 'vez' : 'veces'})</span>` : ''}</td>
       <td class="num">${f.anticipada ? hm(f.anticipada) : ''}</td>
-      <td class="num">${f.faltas ? `<span class="badge err">${f.faltas}</span>` : ''}</td>
+      <td class="num">${f.faltas ? `<span class="badge err">${dec(f.faltas)}</span>` : ''}</td>
       <td class="num">${f.sin_salida ? `<span class="badge warn">${f.sin_salida}</span>` : ''}</td></tr>`).join('')
       || `<tr><td colspan="${colsPersona() + 7}" class="empty">Sin empleados con esos filtros</td></tr>`}
     </tbody>${filas.length ? `<tfoot><tr><td colspan="${colsPersona() + 1}">Total · ${filas.length} empleados</td><td class="num">${t.dias}</td>
       <td class="num">${hm(t.minutos)}</td><td class="num">${t.retrasos ? hm(t.retraso) : ''}</td><td class="num">${t.anticipada ? hm(t.anticipada) : ''}</td>
-      <td class="num">${t.faltas || ''}</td><td class="num">${t.sin_salida || ''}</td></tr></tfoot>` : ''}
+      <td class="num">${t.faltas ? dec(t.faltas) : ''}</td><td class="num">${t.sin_salida || ''}</td></tr></tfoot>` : ''}
     </table></div></div>`;
 }
 
@@ -460,20 +460,20 @@ function hojaHtml(h, desde, hasta) {
       <div>${esc(h.empresa)} · Fecha inicial <b>${fechaBO(desde)}</b> · Fecha final <b>${fechaBO(hasta)}</b></div>${personaHtml(h)}</div>
     <div class="table-wrap"><table class="grilla">
       <thead><tr><th rowspan="2">Fecha</th><th rowspan="2">Día</th><th colspan="5">Horario</th><th colspan="7">Marcado</th><th colspan="4">Resultado</th></tr>
-        <tr><th>Nombre</th><th>Entrada</th><th>Salida</th><th>Horas laborales</th><th>Día laboral</th>
+        <tr><th>Turno</th><th>Entrada</th><th>Salida</th><th>Horas laborales</th><th>Día laboral</th>
           <th>Entrada</th><th>Salida</th><th>Salida descanso</th><th>Entrada descanso</th><th>Horas descanso</th><th>Total horas</th><th>Horas trabajadas</th>
           <th>Retraso</th><th>Salida anticipada</th><th>Falta</th><th>Observación</th></tr></thead>
       <tbody>${h.dias.map(d => `<tr class="${d.marcaciones || d.laboral ? '' : 'vacio'}">
         <td>${fechaBO(d.dia)}</td><td>${diaSem(d.dia)}</td>
-        <td>${esc(d.horario)}</td><td>${v(d.h_entrada)}</td><td>${v(d.h_salida)}</td><td>${hm(d.h_minutos)}</td><td>${d.horario ? d.laboral : ''}</td>
-        <td>${v(d.entrada)}</td><td>${v(d.salida)}</td><td>${v(d.descanso_ini)}</td><td>${v(d.descanso_fin)}</td>
+        <td>${esc(d.turno)}</td><td>${v(d.h_entrada)}</td><td>${v(d.h_salida)}${mas1(d.h_salida_sig)}</td><td>${hm(d.h_minutos)}</td><td>${d.horario ? dec(d.laboral) : ''}</td>
+        <td>${v(d.entrada)}</td><td>${v(d.salida)}${mas1(d.salida_sig)}</td><td>${v(d.descanso_ini)}</td><td>${v(d.descanso_fin)}</td>
         <td>${hm(d.descanso)}</td><td>${hm(d.total)}</td><td>${hm(d.minutos)}</td>
         <td class="${d.retraso ? 't-warn' : ''}">${d.retraso ? hm(d.retraso) : ''}</td>
         <td class="${d.anticipada ? 't-warn' : ''}">${d.anticipada ? hm(d.anticipada) : ''}</td>
-        <td class="${d.falta ? 't-err' : ''}">${d.falta || ''}</td>
+        <td class="${d.falta ? 't-err' : ''}">${d.falta ? dec(d.falta) : ''}</td>
         <td class="obs">${d.estado === 'falta' ? estadoBadge('falta') + ' ' : ''}${esc(d.obs)}</td></tr>`).join('')}</tbody>
       <tfoot><tr><td colspan="6">Totales</td><td>${t.laborables}</td><td colspan="4"></td><td>${hm(t.descanso)}</td><td>${hm(t.total)}</td>
-        <td>${hm(t.minutos)}</td><td>${hm(t.retraso)}</td><td>${hm(t.anticipada)}</td><td>${t.faltas}</td>
+        <td>${hm(t.minutos)}</td><td>${hm(t.retraso)}</td><td>${hm(t.anticipada)}</td><td>${dec(t.faltas)}</td>
         <td class="obs">${t.dias} ${t.dias === 1 ? 'día trabajado' : 'días trabajados'} · ${t.retrasos} ${t.retrasos === 1 ? 'retraso' : 'retrasos'}${t.sin_salida ? ` · ${t.sin_salida} sin salida` : ''}</td></tr></tfoot>
     </table></div>
     <p class="hint hoja-pie">Retraso: minutos desde la hora de entrada, cuando se pasa la tolerancia. Falta: no marcó en un día laboral o llegó después del límite. · Generado el ${new Date().toLocaleString('es-BO')}</p>
@@ -560,7 +560,7 @@ VIEWS['rep-fecha'] = { title: 'Reporte por fecha', render() {
     return { xlsx: { path: '/reportes/fecha', p, nombre: `asistencia_${r.dia}.xlsx` },
       html: `<div class="apaisado">${repCabecera('Asistencia del día', fecha)}<div class="tiles">
         <div class="card tile"><div class="k">Presentes</div><div class="v">${t.presentes}<small> / ${r.filas.length}</small></div></div>
-        <div class="card tile"><div class="k">Faltas</div><div class="v">${t.faltas}</div></div>
+        <div class="card tile"><div class="k">Faltas</div><div class="v">${dec(t.faltas)}</div></div>
         <div class="card tile"><div class="k">Retrasos</div><div class="v">${t.retrasos}</div></div>
         <div class="card tile"><div class="k">Sin salida</div><div class="v">${t.sin_salida}</div></div>
         <div class="card tile"><div class="k">Horas trabajadas</div><div class="v">${hm(t.minutos)}</div></div></div>
@@ -568,8 +568,8 @@ VIEWS['rep-fecha'] = { title: 'Reporte por fecha', render() {
         <thead><tr>${thPersona()}<th>Sucursal</th><th>Horario</th><th>Entrada</th><th>Descanso</th>
           <th>Salida</th><th>Horas</th><th>Retraso</th><th>Estado</th></tr></thead><tbody>
         ${r.filas.map(f => `<tr>${tdPersona(f)}<td>${esc(f.sucursal)}</td>
-          <td class="num">${f.h_entrada ? `${f.h_entrada}–${f.h_salida}` : f.horario ? '<span class="hint">Libre</span>' : '<span class="hint">Sin horario</span>'}</td>
-          <td class="num">${f.entrada || ''}</td><td class="num">${f.almuerzo || ''}</td><td class="num">${f.salida || ''}</td><td class="num">${hm(f.minutos)}</td>
+          <td class="num">${f.h_entrada ? `${esc(f.turno)} · ${f.h_entrada}–${f.h_salida}${mas1(f.h_salida_sig)}` : f.horario ? '<span class="hint">Libre</span>' : '<span class="hint">Sin horario</span>'}</td>
+          <td class="num">${f.entrada || ''}</td><td class="num">${f.almuerzo || ''}</td><td class="num">${f.salida || ''}${mas1(f.salida_sig)}</td><td class="num">${hm(f.minutos)}</td>
           <td class="num">${f.retraso ? `<b class="t-warn">${hm(f.retraso)}</b>` : ''}</td>
           <td class="obs">${estadoBadge(f.estado)}${conDetalle.includes(f.estado) && f.obs ? ` <span class="hint">${esc(f.obs)}</span>` : ''}</td></tr>`).join('')
           || `<tr><td colspan="${colsPersona() + 8}" class="empty">Sin empleados ni marcaciones este día</td></tr>`}
@@ -585,9 +585,12 @@ function repMoverDia(n) {
 // Una fila por marcación, como el Excel. Se imprime en horizontal. Con la casilla "Una hoja por persona",
 // cada persona va en su hoja (una página impresa, una pestaña en Excel) con su total de retraso y sus faltas.
 const MARC_COLOR = { entrada: 'ok', salida: 'acc', descanso_ini: '', descanso_fin: '' };
-const marcEstado = f => f.repetida || f.estado === 'intermedia' ? `<span class="hint">${esc(f.estado_texto)}</span>`
+const marcEstado = f => f.repetida || f.estado === 'intermedia' || f.estado === 'fuera' ? `<span class="hint">${esc(f.estado_texto)}</span>`
   : `<span class="badge ${MARC_COLOR[f.estado]}">${esc(f.estado_texto)}</span>`;
-const marcRetraso = f => f.falta ? `<span class="badge err" title="${esc(f.obs)}">Falta</span>` : f.retraso ? `<b class="t-warn">${hm(f.retraso)}</b>` : '';
+const marcRetraso = f => f.falta ? `<span class="badge err" title="${esc(f.obs)}">Falta${f.falta === 1 ? '' : ' ' + dec(f.falta)}</span>`
+  : f.retraso ? `<b class="t-warn">${hm(f.retraso)}</b>` : '';
+// El turno de la marcación y, si es de uno que empezó otro día (la salida de uno de noche), ese día
+const marcTurno = f => f.turno ? esc(f.turno) + (f.turno_dia !== f.dia ? ` <span class="hint">(del ${fechaBO(f.turno_dia).slice(0, 5)})</span>` : '') : '';
 const cuentaMarc = r => `${r.total} ${r.total === 1 ? 'marcación' : 'marcaciones'} · ${r.personas} ${r.personas === 1 ? 'persona' : 'personas'}`;
 
 // Tabla de marcaciones del filtro (r: respuesta de /reportes/marcaciones): el detalle de marcaciones y, con
@@ -596,12 +599,12 @@ function tablaMarcaciones(r, titulo = '') {
   // Una línea más marcada donde empieza otra persona
   const filas = r.filas.map((f, i) => `<tr class="${i && f.clave !== r.filas[i - 1].clave ? 'corte' : ''}">${tdPersona(f)}
     <td class="num">${fechaBO(f.dia)}</td><td>${diaSem(f.dia).slice(0, 3)}</td><td>${esc(f.sucursal)}</td><td>${esc(f.dispositivo)}</td>
-    <td class="num"><b>${f.hora}</b></td><td>${marcEstado(f)}</td><td class="num">${marcRetraso(f)}</td><td>${esc(f.metodo)}</td></tr>`).join('');
+    <td class="num"><b>${f.hora}</b></td><td>${marcEstado(f)}</td><td>${marcTurno(f)}</td><td class="num">${marcRetraso(f)}</td><td>${esc(f.metodo)}</td></tr>`).join('');
   const corte = r.total > r.filas.length ? `<span class="hint">Se muestran las primeras ${r.filas.length}; el Excel trae las ${r.total}</span>` : '';
   return `<div class="card rep-marc"><div class="card-h">${titulo ? `<h2>${titulo}</h2><span class="hint">${cuentaMarc(r)}</span>` : `<h2>${cuentaMarc(r)}</h2>`}${corte}</div>
     <div class="table-wrap"><table class="grilla rep"><thead><tr>${thPersona()}<th>Fecha</th><th>Día</th><th>Sucursal</th><th>Dispositivo</th>
-      <th>Hora marcación</th><th>Estado de marcación</th><th>Retraso</th><th>Método de verificación</th></tr></thead>
-    <tbody>${filas || `<tr><td colspan="${colsPersona() + 8}" class="empty">Sin marcaciones con esos filtros</td></tr>`}</tbody></table></div></div>`;
+      <th>Hora marcación</th><th>Estado de marcación</th><th>Turno</th><th>Retraso</th><th>Método de verificación</th></tr></thead>
+    <tbody>${filas || `<tr><td colspan="${colsPersona() + 9}" class="empty">Sin marcaciones con esos filtros</td></tr>`}</tbody></table></div></div>`;
 }
 const marcCasilla = () => `<label class="casilla" title="Cada persona en su hoja: una página al imprimir y una pestaña en el Excel">
   <input type="checkbox" ${rep.porPersona ? 'checked' : ''} onchange="rep.porPersona = this.checked; render()"> Una hoja por persona</label>`;
@@ -611,13 +614,13 @@ function marcHojaHtml(g, desde, hasta) {
     <div class="hoja-cab"><h2>Detalle de marcaciones</h2>
       <div>${esc(g.empresa)} · Fecha inicial <b>${fechaBO(desde)}</b> · Fecha final <b>${fechaBO(hasta)}</b></div>${personaHtml(g)}</div>
     <div class="table-wrap"><table class="grilla rep"><thead><tr><th>Fecha</th><th>Día</th><th>Sucursal</th><th>Dispositivo</th>
-      <th>Hora marcación</th><th>Estado de marcación</th><th>Retraso</th><th>Método de verificación</th></tr></thead>
+      <th>Hora marcación</th><th>Estado de marcación</th><th>Turno</th><th>Retraso</th><th>Método de verificación</th></tr></thead>
     <tbody>${g.filas.map(f => `<tr><td class="num">${fechaBO(f.dia)}</td><td>${diaSem(f.dia).slice(0, 3)}</td><td>${esc(f.sucursal)}</td>
-      <td>${esc(f.dispositivo)}</td><td class="num"><b>${f.hora}</b></td><td>${marcEstado(f)}</td><td class="num">${marcRetraso(f)}</td>
-      <td>${esc(f.metodo)}</td></tr>`).join('') || '<tr><td colspan="8" class="empty">Sin marcaciones en el período</td></tr>'}</tbody>
+      <td>${esc(f.dispositivo)}</td><td class="num"><b>${f.hora}</b></td><td>${marcEstado(f)}</td><td>${marcTurno(f)}</td><td class="num">${marcRetraso(f)}</td>
+      <td>${esc(f.metodo)}</td></tr>`).join('') || '<tr><td colspan="9" class="empty">Sin marcaciones en el período</td></tr>'}</tbody>
     <tfoot><tr><td colspan="4">Totales</td><td class="num">${g.marcaciones} ${g.marcaciones === 1 ? 'marcación' : 'marcaciones'}</td>
-      <td>${g.retrasos} ${g.retrasos === 1 ? 'retraso' : 'retrasos'}</td><td class="num">${hm(g.retraso)}</td>
-      <td class="${g.faltas ? 't-err' : ''}">Faltas en el período: ${g.faltas}</td></tr></tfoot></table></div></div>`;
+      <td>${g.retrasos} ${g.retrasos === 1 ? 'retraso' : 'retrasos'}</td><td></td><td class="num">${hm(g.retraso)}</td>
+      <td class="${g.faltas ? 't-err' : ''}">Faltas en el período: ${dec(g.faltas)}</td></tr></tfoot></table></div></div>`;
 }
 
 VIEWS['rep-marcaciones'] = { title: 'Detalle de marcaciones', render() {
@@ -639,23 +642,44 @@ VIEWS['rep-marcaciones'] = { title: 'Detalle de marcaciones', render() {
   });
 }};
 
-/* ---------- Horarios y feriados ---------- */
-// Un horario dice, por día de la semana, la entrada, la salida y después de qué hora llegar es falta.
-// Cada empresa tiene un horario principal (desde una fecha) que rige para todo su personal; quien trabaja
-// distinto tiene una excepción (Empleados → Horario propio).
+/* ---------- Horarios, turnos y feriados ---------- */
+// Un turno es un bloque de trabajo: entrada, salida (si es menor que la entrada, termina al día siguiente), hasta qué
+// hora se puede llegar sin falta, entre qué horas se acepta marcar y, si tiene, un descanso flexible. Un horario
+// semanal dice qué turno toca cada día. Cada empresa tiene un horario principal (desde una fecha) que rige para todo
+// su personal; quien trabaja distinto tiene una excepción (Empleados → Horario propio).
 const DIA_CORTO = ['Do', 'Lu', 'Ma', 'Mi', 'Ju', 'Vi', 'Sá'], ORDEN_SEM = [1, 2, 3, 4, 5, 6, 0];
-let horCache = [], principalCache = { hoy: '', empresas: [] }, feriadosAnio = new Date().getFullYear();
-// "Lu–Vi 08:00–18:00 · Sá 08:00–12:00": agrupa los días seguidos con las mismas horas
+const COLOR_TURNO = { teal: ['#0f766e', 'Verde azulado'], blue: ['#1d4ed8', 'Azul'], orange: ['#c2410c', 'Naranja'], purple: ['#6d28d9', 'Morado'], gray: ['#475569', 'Gris'] };
+let horCache = [], turCache = [], principalCache = { hoy: '', empresas: [] }, feriadosAnio = new Date().getFullYear();
+const dec = n => String(n).replace('.', ',');
+const punto = color => `<span class="punto" style="background:${(COLOR_TURNO[color] || COLOR_TURNO.teal)[0]}"></span>`;
+const mas1 = sig => sig ? '<span class="mas1" title="Del día siguiente">+1</span>' : '';
+
+// Igual que el servidor: minutos desde las 00:00 del día del turno. Una hora menor que la entrada es del día siguiente;
+// "acepta desde", mayor que la entrada, del día anterior.
+const aMin = h => /^\d{2}:\d{2}/.test(h || '') ? Number(h.slice(0, 2)) * 60 + Number(h.slice(3, 5)) : null;
+const durMin = v => { const m = /^(\d{1,2}):(\d{2})$/.exec(String(v || '').trim()); return m ? Number(m[1]) * 60 + Number(m[2]) : /^\d+$/.test(String(v || '').trim()) ? Number(v) : 0; };
+function horasTurno(t) {
+  const E = aMin(t.entrada) ?? 0, despues = h => { const m = aMin(h); return m == null ? E : m < E ? m + 1440 : m; };
+  const s = aMin(t.salida), S = s == null ? E : s <= E ? s + 1440 : s;
+  let sH = despues(t.marca_hasta); if (sH < S) sH += 1440;
+  const d = aMin(t.marca_desde), eD = d == null ? E : d > E ? d - 1440 : d;
+  const dur = t.descanso ? durMin(t.descanso_min) : 0;
+  return { E, S, L: despues(t.limite_falta), eD, sH, dur, dD: dur ? despues(t.descanso_desde) : null, dL: dur ? despues(t.descanso_limite) : null };
+}
+const horasTexto = t => `${t.entrada}–${t.salida}${mas1(horasTurno(t).S >= 1440)}`;
+
+// "Lu–Vi Oficina 09:00–18:00 · Sá Medio día 08:00–12:00": agrupa los días seguidos con el mismo turno
 function resumenDias(dias) {
   const por = Object.fromEntries(dias.map(d => [d.dia, d])), grupos = [];
   ORDEN_SEM.forEach((n, i) => {
-    const d = por[n], clave = d && `${d.entrada}|${d.salida}|${d.limite_falta}`, g = grupos[grupos.length - 1];
+    const d = por[n], g = grupos[grupos.length - 1];
     if (!d) return;
-    if (g && g.clave === clave && g.fin === ORDEN_SEM[i - 1]) g.fin = n; else grupos.push({ clave, ini: n, fin: n, d });
+    if (g && g.d.turno_id === d.turno_id && g.fin === ORDEN_SEM[i - 1]) g.fin = n; else grupos.push({ ini: n, fin: n, d });
   });
-  return grupos.map(g => `<div>${DIA_CORTO[g.ini]}${g.fin !== g.ini ? '–' + DIA_CORTO[g.fin] : ''} ${g.d.entrada}–${g.d.salida}
-    <span class="hint">· falta después de ${g.d.limite_falta}</span></div>`).join('') || '<span class="hint">Sin días de trabajo</span>';
+  return grupos.map(g => `<div>${DIA_CORTO[g.ini]}${g.fin !== g.ini ? '–' + DIA_CORTO[g.fin] : ''} ${punto(g.d.color)}<b>${esc(g.d.turno)}</b>
+    <span class="hint">${horasTexto(g.d)}</span></div>`).join('') || '<span class="hint">Sin días de trabajo</span>';
 }
+const descansoTexto = t => t.descanso_min ? `${hm(t.descanso_min)} desde ${t.descanso_desde}` : '<span class="hint">Corrido</span>';
 // Cambios del horario principal de una empresa (vienen del más nuevo al más viejo): el que rige hoy,
 // los programados para más adelante y los anteriores
 function principalDe(e) {
@@ -666,9 +690,9 @@ function principalDe(e) {
 
 VIEWS.horarios = { title: 'Horarios', async render() {
   const emp = scope().empresa_id, ed = puedeEditar(), ec = isAdmin() && !emp;
-  const [hs, pr, fs] = await Promise.all([api('/horarios' + qs({ empresa_id: emp })), api('/horarios/principal' + qs({ empresa_id: emp })),
-    api('/feriados' + qs({ empresa_id: emp, anio: feriadosAnio }))]);
-  horCache = hs; principalCache = pr;
+  const [hs, ts, pr, fs] = await Promise.all([api('/horarios' + qs({ empresa_id: emp })), api('/turnos' + qs({ empresa_id: emp })),
+    api('/horarios/principal' + qs({ empresa_id: emp })), api('/feriados' + qs({ empresa_id: emp, anio: feriadosAnio }))]);
+  horCache = hs; turCache = ts; principalCache = pr;
   const anios = [-1, 0, 1].map(k => new Date().getFullYear() + k);
   const cambio = (e, c, clase = '') => `<div class="${clase}">${clase === 'prox' ? '<span class="badge acc">Programado</span> ' : ''}${esc(c.horario || 'Sin horario')} desde ${fechaBO(c.desde)}${ed
     ? ` <button class="btn sm" onclick="borrarCambioPrincipal(${e.empresa_id}, '${c.desde}')" title="Quitar este cambio">Quitar</button>` : ''}</div>`;
@@ -685,15 +709,28 @@ VIEWS.horarios = { title: 'Horarios', async render() {
           <td>${ed ? `<div class="actions"><button class="btn sm primary" onclick="formPrincipal(${e.empresa_id})">${vigente ? 'Cambiar' : 'Elegir horario'}</button></div>` : ''}</td></tr>`; }).join('')
         || '<tr><td colspan="6" class="empty">Sin empresas</td></tr>'}
       </tbody></table></div></div>
-    <div class="card" style="margin-top:18px"><div class="card-h"><h2>${hs.length} horarios</h2>${ed ? '<button class="btn primary" onclick="formHorario()">+ Nuevo horario</button>' : ''}</div>
-      <div class="table-wrap"><table><thead><tr><th>Horario</th>${ec ? '<th>Empresa</th>' : ''}<th>Días y horas</th><th class="num">Tolerancia</th>
+    <div class="card" style="margin-top:18px"><div class="card-h"><h2>${ts.length} ${ts.length === 1 ? 'turno' : 'turnos'}</h2>
+      <span class="hint">Se crean una vez y se usan en los horarios semanales</span>${ed ? '<button class="btn primary" onclick="formTurno()">+ Nuevo turno</button>' : ''}</div>
+      <div class="table-wrap"><table><thead><tr><th>Turno</th>${ec ? '<th>Empresa</th>' : ''}<th>Horas</th><th>Falta después de</th><th>Acepta marcar</th>
+        <th class="num">Tolerancia</th><th>Descanso</th><th class="num">Vale</th><th>Se usa en</th><th></th></tr></thead><tbody>
+      ${ts.map(t => `<tr><td>${punto(t.color)}<b>${esc(t.nombre)}</b></td>${ec ? `<td>${esc(t.empresa)}</td>` : ''}
+        <td class="num" style="white-space:nowrap">${horasTexto(t)}</td><td class="num">${t.limite_falta}</td>
+        <td class="num">${t.marca_desde === '00:00' && t.marca_hasta === '23:59' ? '<span class="hint">Todo el día</span>' : `${t.marca_desde}–${t.marca_hasta}`}</td>
+        <td class="num">${t.tolerancia} min</td><td>${descansoTexto(t)}</td><td class="num">${dec(t.vale)}</td>
+        <td>${t.horarios.length ? esc(t.horarios.join(', ')) : '<span class="hint">Ningún horario</span>'}</td>
+        <td>${ed ? `<div class="actions"><button class="btn sm" onclick="formTurno(${t.id})">Editar</button><button class="btn sm danger" onclick="borrarTurno(${t.id})">Eliminar</button></div>` : ''}</td></tr>`).join('')
+        || `<tr><td colspan="10" class="empty">${ed ? 'Crea el primer turno (por ejemplo, "Oficina" de 08:00 a 18:00) y después úsalo en un horario.' : 'Aún no hay turnos.'}</td></tr>`}
+      </tbody></table></div></div>
+    <div class="card" style="margin-top:18px"><div class="card-h"><h2>${hs.length} ${hs.length === 1 ? 'horario semanal' : 'horarios semanales'}</h2>
+      <span class="hint">Qué turno toca cada día</span>${ed ? '<button class="btn primary" onclick="formHorario()">+ Nuevo horario</button>' : ''}</div>
+      <div class="table-wrap"><table><thead><tr><th>Horario</th>${ec ? '<th>Empresa</th>' : ''}<th>Días y turnos</th>
         <th class="num" title="Empleados que lo tienen hoy (por la empresa o como horario propio)">Empleados</th><th></th></tr></thead><tbody>
       ${hs.map(h => `<tr><td><b>${esc(h.nombre)}</b>${h.principal ? ' <span class="badge acc">Principal</span>' : ''}</td>${ec ? `<td>${esc(h.empresa)}</td>` : ''}
-        <td>${resumenDias(h.dias)}</td><td class="num">${h.tolerancia} min</td><td class="num">${h.empleados}</td>
+        <td>${resumenDias(h.dias)}</td><td class="num">${h.empleados}</td>
         <td>${ed ? `<div class="actions"><button class="btn sm" onclick="formHorario(${h.id})">Editar</button><button class="btn sm danger" onclick="borrarHorario(${h.id})">Eliminar</button></div>` : ''}</td></tr>`).join('')
-        || `<tr><td colspan="6" class="empty">${ed ? 'Crea el primer horario: se puede usar como horario principal de la empresa.' : 'Aún no hay horarios.'}</td></tr>`}
+        || `<tr><td colspan="5" class="empty">${ed ? 'Crea el primer horario: se puede usar como horario principal de la empresa.' : 'Aún no hay horarios.'}</td></tr>`}
       </tbody></table></div></div>
-    <p class="hint">Retraso: si llega después de la entrada más la tolerancia, se cuentan los minutos desde la hora de entrada. Llegar después de la hora de falta, o no marcar en un día de trabajo, cuenta 1 día de falta. Los días sin horario son libres.</p>
+    <p class="hint">Retraso: si llega después de la entrada más la tolerancia, se cuentan los minutos desde la hora de entrada. Llegar después de la hora de falta, o no marcar en un día de trabajo, es falta (lo que vale el turno; en un turno con descanso, cada parte vale la mitad). Los días sin turno son libres. Un turno de noche (por ejemplo, 22:00 a 06:00) cuenta para el día en que empieza.</p>
     <div class="card" style="margin-top:18px"><div class="card-h"><h2>Feriados</h2>
       <select onchange="feriadosAnio = Number(this.value); render()">${anios.map(a => `<option ${a === feriadosAnio ? 'selected' : ''}>${a}</option>`).join('')}</select>
       ${ed ? '<button class="btn primary" onclick="formFeriado()">+ Feriado</button>' : ''}</div>
@@ -722,30 +759,32 @@ async function borrarCambioPrincipal(empresa_id, desde) {
   await run(() => api('/horarios/principal' + qs({ empresa_id, desde }), { method: 'DELETE' }), 'Cambio quitado'); render();
 }
 
-function formHorario(id) {
-  const h = horCache.find(x => x.id === id) || { tolerancia: 10, dias: [1, 2, 3, 4, 5].map(dia => ({ dia, entrada: '08:00', salida: '18:00', limite_falta: '10:00' })) };
-  const por = Object.fromEntries(h.dias.map(d => [d.dia, d]));
+// Horario semanal: el turno de cada día. borrador: lo que se estaba escribiendo antes de ir a crear un turno nuevo.
+function formHorario(id, borrador = null) {
+  const h = horCache.find(x => x.id === id) || { nombre: '', dias: [] };
+  const elegido = borrador ? borrador.dias : Object.fromEntries(h.dias.map(d => [d.dia, String(d.turno_id)]));
+  const empInicial = id ? h.empresa_id : borrador?.empresa_id || (isAdmin() ? Number(scope().empresa_id) || '' : me.empresa_id);
   // Al crear: se propone como principal si la empresa todavía no tiene uno
-  const empresaActual = isAdmin() ? Number(scope().empresa_id) : me.empresa_id;
-  const proponer = !id && empresaActual && !principalDe(principalCache.empresas.find(e => e.empresa_id === empresaActual)).vigente;
+  const sinPrincipal = e => e && !principalDe(principalCache.empresas.find(x => x.empresa_id === Number(e))).vigente;
+  const proponer = borrador ? borrador.principal : !id && sinPrincipal(empInicial);
+  const opciones = (empresa_id, dia, actual) => '<option value="">Libre</option>' + turCache.filter(t => t.empresa_id === Number(empresa_id)).map(t =>
+    `<option value="${t.id}" ${actual === String(t.id) ? 'selected' : ''}>${esc(t.nombre)} · ${t.entrada}–${t.salida}${horasTurno(t).S >= 1440 ? ' (+1)' : ''}</option>`).join('');
   const form = modal({ title: id ? 'Editar horario' : 'Nuevo horario', wide: true, body: `
-    ${isAdmin() && !id ? empresaSelect('empresa_id', scope().empresa_id) : ''}
-    <div class="grid2"><label class="f">Nombre<input name="nombre" required value="${esc(h.nombre)}" placeholder="Ej: Oficina, Obra"></label>
-      <label class="f">Tolerancia (minutos)<input name="tolerancia" type="number" min="0" max="240" required value="${h.tolerancia}"></label></div>
-    <div class="table-wrap"><table class="dias"><thead><tr><th>Día</th><th>Trabaja</th><th>Entrada</th><th>Falta después de</th><th>Salida</th></tr></thead><tbody>
-    ${ORDEN_SEM.map(n => { const d = por[n] || { entrada: '08:00', salida: n === 6 ? '12:00' : '18:00', limite_falta: '10:00' };
-      return `<tr data-dia="${n}"><td><b>${DIA_SEM[n]}</b></td><td><input type="checkbox" name="t${n}" ${por[n] ? 'checked' : ''}></td>
-        <td><input type="time" name="e${n}" value="${d.entrada}" required></td><td><input type="time" name="l${n}" value="${d.limite_falta}" required></td>
-        <td><input type="time" name="s${n}" value="${d.salida}" required></td></tr>`; }).join('')}
+    ${isAdmin() && !id ? empresaSelect('empresa_id', empInicial) : ''}
+    <label class="f">Nombre<input name="nombre" required value="${esc(borrador?.nombre ?? h.nombre)}" placeholder="Ej: Oficina, Obra"></label>
+    <div class="table-wrap"><table class="dias"><thead><tr><th>Día</th><th>Turno</th></tr></thead><tbody>
+    ${ORDEN_SEM.map(n => `<tr><td><b>${DIA_SEM[n]}</b></td><td><select name="d${n}" aria-label="Turno del ${DIA_SEM[n].toLowerCase()}" style="width:100%">
+      ${opciones(empInicial, n, elegido[n] || '')}</select></td></tr>`).join('')}
     </tbody></table></div>
+    <div class="toolbar" style="margin:0"><button type="button" class="btn sm" data-nuevo-turno>+ Nuevo turno</button>
+      <span class="hint" id="hAviso"></span></div>
     ${id ? '' : `<div class="toolbar" style="margin:0"><label style="display:flex;gap:8px;align-items:center"><input type="checkbox" name="principal" ${proponer ? 'checked' : ''}>
-      Usarlo como horario principal de la empresa, desde</label><input type="date" name="principal_desde" value="${hoyISO()}"></div>`}
-    <p class="hint" style="margin:0">Con entrada 08:00 y tolerancia 10: llega 08:08 → sin retraso; 08:15 → 0:15 de retraso; después de la hora de falta → 1 día de falta. Los días sin "Trabaja" son libres.
-      ${id ? '<br><b>Si cambias este horario también cambian los reportes de fechas pasadas</b> de quienes lo tienen. Para un cambio desde una fecha, crea un horario nuevo y ponlo como principal (o como horario propio) desde esa fecha.' : ''}</p>`,
+      Usarlo como horario principal de la empresa, desde</label><input type="date" name="principal_desde" value="${borrador?.principal_desde || hoyISO()}"></div>`}
+    <p class="hint" style="margin:0">Los días en "Libre" no se trabajan.${id ? '<br><b>Si cambias este horario también cambian los reportes de fechas pasadas</b> de quienes lo tienen. Para un cambio desde una fecha, crea un horario nuevo y ponlo como principal (o como horario propio) desde esa fecha.' : ''}</p>`,
     async onSave(f) {
       const b = fd(f);
-      const dias = ORDEN_SEM.filter(n => f.querySelector(`[name=t${n}]`).checked).map(n => ({ dia: n, entrada: b['e' + n], salida: b['s' + n], limite_falta: b['l' + n] }));
-      const body = { empresa_id: b.empresa_id, nombre: b.nombre, tolerancia: b.tolerancia, dias };
+      const dias = ORDEN_SEM.filter(n => b['d' + n]).map(n => ({ dia: n, turno_id: Number(b['d' + n]) }));
+      const body = { empresa_id: b.empresa_id || empInicial, nombre: b.nombre, dias };
       if (id) await api('/horarios/' + id, { method: 'PUT', body });
       else {
         const nuevo = await api('/horarios', { method: 'POST', body });
@@ -753,15 +792,116 @@ function formHorario(id) {
       }
       toast('Horario guardado'); render();
     } });
-  // Un día que no se trabaja no lleva horas
-  const sync = () => ORDEN_SEM.forEach(n => form.querySelectorAll(`tr[data-dia="${n}"] input[type=time]`)
-    .forEach(i => { i.disabled = !form.querySelector(`[name=t${n}]`).checked; }));
-  form.addEventListener('change', sync); sync();
+  const empSel = form.querySelector('[name=empresa_id]'), empresa = () => empSel ? Number(empSel.value) || '' : empInicial;
+  const avisar = () => {
+    const hay = turCache.some(t => t.empresa_id === Number(empresa()));
+    $('#hAviso').textContent = !empresa() ? 'Elige la empresa para ver sus turnos' : hay ? '' : 'Esta empresa aún no tiene turnos: crea el primero con "+ Nuevo turno".';
+  };
+  empSel?.addEventListener('change', () => {
+    ORDEN_SEM.forEach(n => { const s = form.querySelector(`[name=d${n}]`); s.innerHTML = opciones(empresa(), n, ''); });
+    const c = form.querySelector('[name=principal]'); if (c) c.checked = !!sinPrincipal(empresa());
+    avisar();
+  });
+  avisar();
+  // Crear un turno sin perder lo escrito: al guardarlo se vuelve a este horario
+  form.querySelector('[data-nuevo-turno]').onclick = () => {
+    if (!empresa()) return toast('Elige primero la empresa', true);
+    const b = fd(form);
+    const vuelta = { nombre: b.nombre, empresa_id: empresa(), dias: Object.fromEntries(ORDEN_SEM.map(n => [n, b['d' + n] || ''])),
+      principal: !!b.principal, principal_desde: b.principal_desde };
+    formTurno(null, { empresa_id: empresa(), alGuardar: () => formHorario(id, vuelta), alCancelar: () => formHorario(id, vuelta) });
+  };
 }
 async function borrarHorario(id) {
   const h = horCache.find(x => x.id === id);
   if (!confirmar(`¿Eliminar el horario "${h.nombre}"?`)) return;
   await run(() => api('/horarios/' + id, { method: 'DELETE' }), 'Horario eliminado'); render();
+}
+
+// Turno: la ventana del mockup (Horario · Descanso · Fuera del turno) con la línea de tiempo que se redibuja al escribir
+const reloj = m => { const x = ((m % 1440) + 1440) % 1440; return `${String(Math.floor(x / 60)).padStart(2, '0')}:${String(x % 60).padStart(2, '0')}`; };
+function formTurno(id, { empresa_id = null, alGuardar = null, alCancelar = null } = {}) {
+  const t = turCache.find(x => x.id === id) || { nombre: '', color: 'teal', vale: 1, entrada: '08:00', tolerancia: 10, marca_desde: '06:00',
+    limite_falta: '10:00', salida: '18:00', marca_hasta: '22:00', descanso_min: null, descanso_desde: '12:00', descanso_limite: '15:00', fuera: 'sin_turno' };
+  const hora = (etiqueta, name, valor) => `<label class="f">${etiqueta}<span class="con-mas1"><input type="time" name="${name}" value="${valor || ''}">
+    <span class="mas1 hidden" data-mas1="${name}"></span></span></label>`;
+  const VALES = [[0.5, '0,5 día'], [1, '1 día'], [1.5, '1,5 días'], [2, '2 días']];
+  const FUERA = [['sin_turno', 'Mostrarlas como "marcó fuera del turno"', 'Se ven en los reportes con su hora, pero no suman horas ni cuentan como falta.'],
+    ['trabajadas', 'Sumarlas al turno de ese día', 'Se toman como parte del turno más cercano (del mismo día o, si es de noche, del día siguiente).']];
+  const form = modal({ title: id ? 'Editar turno' : 'Nuevo turno', wide: true, saveText: 'Guardar turno', body: `
+    ${isAdmin() && !id && !empresa_id ? empresaSelect('empresa_id', scope().empresa_id) : ''}
+    <div class="grid2"><label class="f">Nombre del turno<input name="nombre" value="${esc(t.nombre)}" placeholder="Ej: Oficina, Mañana, Noche"></label>
+      <label class="f">Vale como (día pagado)<select name="vale">${VALES.map(([v, txt]) => `<option value="${v}" ${Number(t.vale) === v ? 'selected' : ''}>${txt}</option>`).join('')}</select></label></div>
+    <input type="hidden" name="color" value="${esc(t.color || 'teal')}">
+    <div class="tabs">${[['horario', 'Horario'], ['descanso', 'Descanso'], ['fuera', 'Fuera del turno']].map(([k, txt], i) =>
+      `<button type="button" data-pestana="${k}" class="${i ? '' : 'on'}" aria-pressed="${!i}">${txt}</button>`).join('')}</div>
+    <div data-ver="horario" style="display:flex;flex-direction:column;gap:14px">
+      <div class="grid2">
+        <fieldset class="grupo"><legend>Entrada</legend>${hora('Hora de entrada', 'entrada', t.entrada)}
+          <label class="f">Tolerancia (minutos)<input type="number" name="tolerancia" min="0" max="240" value="${t.tolerancia}"></label>
+          ${hora('Acepta la marcación desde', 'marca_desde', t.marca_desde)}${hora('Falta si llega después de', 'limite_falta', t.limite_falta)}</fieldset>
+        <fieldset class="grupo"><legend>Salida</legend>${hora('Hora de salida', 'salida', t.salida)}${hora('Acepta la marcación hasta', 'marca_hasta', t.marca_hasta)}
+          <p class="hint" style="grid-column:1/-1;margin:0">Salir antes de la hora de salida cuenta como salida anticipada. Una marcación después de "hasta" ya no se toma como de este turno.</p></fieldset>
+      </div>
+      <div class="linea"></div>
+      <p class="hint" style="margin:0">Los días cruzados se calculan solos y desde la entrada: si una hora es menor que la de entrada, es del día siguiente. Un turno de 22:00 a 06:00 pertenece al día en que empieza. Para agrupar las marcaciones por fecha como antes, acepta desde 00:00 hasta 23:59.</p>
+    </div>
+    <div data-ver="descanso" class="hidden" style="display:flex;flex-direction:column;gap:14px">
+      <label style="display:flex;gap:10px;align-items:center;font-weight:600"><input type="checkbox" name="descanso" ${t.descanso_min ? 'checked' : ''}> Este turno tiene descanso (almuerzo)</label>
+      <div class="grid3">${hora('Puede salir desde', 'descanso_desde', t.descanso_desde || '12:00')}
+        <label class="f">Duración (horas:minutos)<input name="descanso_min" value="${t.descanso_min ? hm(t.descanso_min) : '1:00'}" placeholder="1:30"></label>
+        ${hora('Falta de la 2.ª parte si vuelve después de', 'descanso_limite', t.descanso_limite || '15:00')}</div>
+      <div class="reglas"><b>Cómo se calcula</b>
+        <span>• Es flexible: sale cuando quiere desde "Puede salir desde", y es retraso solo lo que se pase de la duración.</span>
+        <span>• Cada parte del turno vale la mitad: volver después de la hora de falta, o no marcar la salida o el regreso, es falta de esa parte.</span>
+        <span>• Si no marca nada en el descanso no hay falta: se descuenta la duración y queda el aviso "No marcó el descanso".</span></div>
+    </div>
+    <div data-ver="fuera" class="hidden" style="display:flex;flex-direction:column;gap:10px">
+      <p style="margin:0">¿Qué hacer con las marcaciones que no caen entre "acepta desde" y "acepta hasta"? Por ejemplo, alguien del turno de noche que marca a las 14:00.</p>
+      ${FUERA.map(([v, txt, desc]) => `<label class="opcion"><input type="radio" name="fuera" value="${v}" ${t.fuera === v ? 'checked' : ''}>
+        <span><b>${txt}</b><span class="hint">${desc}</span></span></label>`).join('')}
+    </div>
+    ${id ? '<p class="hint" style="margin:0"><b>Si cambias este turno también cambian los reportes de fechas pasadas</b> de quienes lo tienen.</p>' : ''}`,
+    async onSave(f) {
+      const b = fd(f), body = { ...b, descanso: f.querySelector('[name=descanso]').checked, empresa_id: b.empresa_id || empresa_id };
+      if (id) await api('/turnos/' + id, { method: 'PUT', body }); else await api('/turnos', { method: 'POST', body });
+      toast('Turno guardado');
+      if (alGuardar) { turCache = await api('/turnos' + qs({ empresa_id: scope().empresa_id })); setTimeout(alGuardar); } else render();
+    } });
+  if (alCancelar) form.querySelectorAll('[data-close]').forEach(b => b.onclick = () => { closeModal(); alCancelar(); });
+  // Pestañas
+  form.querySelectorAll('[data-pestana]').forEach(b => b.onclick = () => {
+    form.querySelectorAll('[data-pestana]').forEach(x => { x.classList.toggle('on', x === b); x.setAttribute('aria-pressed', x === b); });
+    form.querySelectorAll('[data-ver]').forEach(p => p.classList.toggle('hidden', p.dataset.ver !== b.dataset.pestana));
+  });
+  const descanso = form.querySelector('[name=descanso]');
+  const pintar = () => {
+    ['descanso_desde', 'descanso_min', 'descanso_limite'].forEach(n => { form.querySelector(`[name=${n}]`).disabled = !descanso.checked; });
+    const v = { ...fd(form), descanso: descanso.checked }, h = horasTurno(v), tol = Math.max(0, Number(v.tolerancia) || 0);
+    for (const [k, m] of Object.entries({ marca_desde: h.eD, limite_falta: h.L, salida: h.S, marca_hasta: h.sH, descanso_desde: h.dD, descanso_limite: h.dL })) {
+      const txt = m == null ? '' : m >= 1440 ? '+1 día' : m < 0 ? '−1 día' : '', el = form.querySelector(`[data-mas1="${k}"]`);
+      el.textContent = txt; el.classList.toggle('hidden', !txt);
+    }
+    const ini = Math.floor((Math.min(h.eD, h.E) - 60) / 120) * 120, fin = Math.ceil((Math.max(h.sH, h.S, h.dL ?? h.S) + 60) / 120) * 120;
+    const pct = m => ((m - ini) / (fin - ini) * 100).toFixed(2) + '%', ancho = (a, b) => (Math.max(0, b - a) / (fin - ini) * 100).toFixed(2) + '%';
+    const seg = (a, b, color, titulo) => `<span style="left:${pct(a)};width:${ancho(a, b)};background:${color}" title="${titulo}"></span>`;
+    const paso = fin - ini > 1800 ? 180 : 120, ticks = [];
+    for (let m = ini; m <= fin; m += paso) ticks.push(`<span style="left:${pct(m)}">${reloj(m)}${m >= 1440 ? ' +1' : ''}</span>`);
+    const total = h.S - h.E, vale = Number(v.vale);
+    form.querySelector('.linea').innerHTML = `<div><b>Así queda:</b> ${reloj(h.E)} a ${reloj(h.S)} · ${hm(total)} h${h.dur
+      ? ` − ${hm(h.dur)} de descanso = ${hm(total - h.dur)} h de trabajo` : ' de trabajo'} · vale ${dec(vale)} ${vale > 1 ? 'días' : 'día'}${h.S >= 1440 ? ' <span class="mas1">Cruza la medianoche</span>' : ''}</div>
+      <div class="filas"><span>Marcación</span><div class="barra">${seg(h.eD, h.L, '#a7d8d1', 'Se acepta la entrada')}${seg(h.E, h.E + tol, '#d97706', 'Tolerancia')}${seg(h.S, h.sH, '#a7d8d1', 'Se acepta la salida')}</div>
+        <span>Turno</span><div class="barra">${seg(h.E, h.S, '#0f766e', 'Trabajo')}${h.dur ? seg(h.dD, h.dD + h.dur, '#94a3b8', 'Descanso') : ''}${ini < 1440 && fin > 1440 ? `<i style="left:${pct(1440)}" title="Medianoche"></i>` : ''}</div>
+        <span></span><div class="eje">${ticks.join('')}</div></div>
+      <div class="leyenda"><span><i style="background:#a7d8d1"></i>Se acepta la marcación</span><span><i style="background:#d97706"></i>Tolerancia</span>
+        <span><i style="background:#0f766e"></i>Trabajo</span><span><i style="background:#94a3b8"></i>Descanso</span><span><i style="background:#5b21b6;width:2px"></i>Medianoche</span></div>`;
+  };
+  form.addEventListener('input', pintar); form.addEventListener('change', pintar); pintar();
+}
+async function borrarTurno(id) {
+  const t = turCache.find(x => x.id === id);
+  if (!confirmar(`¿Eliminar el turno "${t.nombre}"?`)) return;
+  await run(() => api('/turnos/' + id, { method: 'DELETE' }), 'Turno eliminado'); render();
 }
 function formFeriado() {
   modal({ title: 'Nuevo feriado', body: `
