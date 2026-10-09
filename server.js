@@ -108,6 +108,9 @@ $$;
 CREATE TABLE IF NOT EXISTS feriados (
   id SERIAL PRIMARY KEY, empresa_id INT REFERENCES empresas(id) ON DELETE CASCADE,
   fecha DATE NOT NULL, nombre TEXT NOT NULL, UNIQUE NULLS NOT DISTINCT (empresa_id, fecha));
+-- Intentos fallidos de inicio de sesión, por correo (exista o no la cuenta)
+CREATE TABLE IF NOT EXISTS intentos_login (
+  email TEXT PRIMARY KEY, fallidos INT NOT NULL DEFAULT 0, bloqueado_hasta TIMESTAMPTZ, ultimo TIMESTAMPTZ NOT NULL DEFAULT now());
 CREATE INDEX IF NOT EXISTS idx_marc_fecha ON marcaciones(fecha);
 CREATE INDEX IF NOT EXISTS idx_cmd_pend ON comandos(dispositivo_id, estado);
 `;
@@ -146,6 +149,15 @@ function checkPass(p, h) {
   if (!salt || !k) return false;
   const d = crypto.scryptSync(String(p), salt, 64);
   return crypto.timingSafeEqual(d, Buffer.from(k, 'hex'));
+}
+// Para un correo que no existe se verifica igual contra esta clave: tarda lo mismo y no delata qué correos existen
+const HASH_FALSO = hashPass(crypto.randomBytes(16).toString('hex'));
+// Claves nuevas: mínimo 8 caracteres, con letras y números. Las que ya existen siguen sirviendo.
+function validarClave(p) {
+  p = String(p ?? '');
+  if (p.length < 8 || p.length > 128 || !/\p{L}/u.test(p) || !/\d/.test(p))
+    throw new HttpError(400, 'La contraseña debe tener al menos 8 caracteres, con letras y números');
+  return p;
 }
 function signToken(obj) {
   const b = Buffer.from(JSON.stringify(obj)).toString('base64url');
@@ -624,10 +636,39 @@ app.post('/iclock/devicecmd', async (req, res) => {
 app.all('/iclock/{*resto}', (req, res) => res.type('text/plain').send('OK'));
 
 // ===== API del dashboard =====
+// Bloqueo por intentos: 5 claves mal seguidas bloquean ese correo 15 minutos (los dos paneles). El intento se cuenta
+// antes de revisar la clave, así varios pedidos a la vez no consiguen más de 5. Una entrada correcta borra la cuenta;
+// fallos de hace más de 15 minutos ya no suman. Todo es igual exista o no el correo.
+const MAX_INTENTOS = 5, BLOQUEO_MIN = 15;
+const minutosRestantes = hasta => Math.max(1, Math.ceil((new Date(hasta) - Date.now()) / 60000));
+const errorBloqueo = hasta => new HttpError(429, `Por seguridad, la cuenta está bloqueada por ${MAX_INTENTOS} intentos fallidos. ` +
+  `Vuelve a intentar en ${minutosRestantes(hasta)} min, o pide a un administrador que la desbloquee.`);
+
 app.post('/api/login', async (req, res) => {
-  const { email, password, panel } = req.body || {};
-  const u = await one(`SELECT * FROM usuarios_sistema WHERE lower(email)=lower($1)`, [email || '']);
-  if (!u || !checkPass(password || '', u.hash)) throw new HttpError(401, 'Correo o contraseña incorrectos');
+  const { password, panel } = req.body || {};
+  const correo = clean(req.body?.email).toLowerCase();
+  if (!correo || !password) throw new HttpError(400, 'Escribe tu correo y tu contraseña');
+  const intento = await one(`
+    INSERT INTO intentos_login AS i (email, fallidos) VALUES ($1, 1)
+    ON CONFLICT (email) DO UPDATE SET
+      fallidos = CASE WHEN i.bloqueado_hasta > now() THEN i.fallidos
+        WHEN i.bloqueado_hasta IS NOT NULL OR i.ultimo < now() - make_interval(mins => $2) THEN 1 ELSE i.fallidos + 1 END,
+      bloqueado_hasta = CASE WHEN i.bloqueado_hasta > now() THEN i.bloqueado_hasta END,
+      ultimo = CASE WHEN i.bloqueado_hasta > now() THEN i.ultimo ELSE now() END
+    RETURNING fallidos, bloqueado_hasta`, [correo, BLOQUEO_MIN]);
+  if (intento.bloqueado_hasta) throw errorBloqueo(intento.bloqueado_hasta);
+  const bloquear = () => one(`UPDATE intentos_login SET bloqueado_hasta = now() + make_interval(mins => $2)
+    WHERE email=$1 AND bloqueado_hasta IS NULL RETURNING bloqueado_hasta`, [correo, BLOQUEO_MIN]);
+  if (intento.fallidos > MAX_INTENTOS) { await bloquear(); throw errorBloqueo(Date.now() + BLOQUEO_MIN * 60e3); }
+  const u = await one(`SELECT * FROM usuarios_sistema WHERE lower(email)=$1`, [correo]);
+  const correcta = String(password).length <= 128 && checkPass(password, u ? u.hash : HASH_FALSO) && !!u;
+  if (!correcta) {
+    const quedan = MAX_INTENTOS - intento.fallidos;
+    if (quedan <= 0) { await bloquear(); throw errorBloqueo(Date.now() + BLOQUEO_MIN * 60e3); }
+    throw new HttpError(401, `Correo o contraseña incorrectos. ${quedan === 1 ? 'Te queda 1 intento' : `Te quedan ${quedan} intentos`} ` +
+      `antes de que la cuenta se bloquee ${BLOQUEO_MIN} minutos.`);
+  }
+  await q(`DELETE FROM intentos_login WHERE email=$1`, [correo]);
   // Cada panel tiene su link: la plataforma entra por /admin y las empresas por /clientes
   if (panel !== (u.rol === 'admin' ? 'admin' : 'clientes'))
     throw new HttpError(403, u.rol === 'admin' ? 'Este acceso es de administrador: entra por /admin' : 'Este acceso es de cliente: entra por /clientes');
@@ -667,8 +708,7 @@ app.post('/api/me/password', async (req, res) => {
   const { actual, nueva } = req.body;
   const u = await one(`SELECT * FROM usuarios_sistema WHERE id=$1`, [req.user.id]);
   if (!checkPass(actual || '', u.hash)) throw new HttpError(400, 'La contraseña actual no es correcta');
-  if (!nueva || nueva.length < 6) throw new HttpError(400, 'Mínimo 6 caracteres');
-  await q(`UPDATE usuarios_sistema SET hash=$2 WHERE id=$1`, [u.id, hashPass(nueva)]);
+  await q(`UPDATE usuarios_sistema SET hash=$2 WHERE id=$1`, [u.id, hashPass(validarClave(nueva))]);
   res.json({ ok: true });
 });
 
@@ -1275,13 +1315,18 @@ const COLS_HOJA = [['Fecha', 11], ['Día', 10], ['Horario', 16], ['Entrada horar
   ['Día laboral', 8], ['Entrada', 9], ['Salida', 9], ['Salida descanso', 9], ['Entrada descanso', 9], ['Horas descanso', 9, 'horas'],
   ['Total horas', 9, 'horas'], ['Horas trabajadas', 10, 'horas'], ['Retraso', 9, 'horas'], ['Salida anticipada', 10, 'horas'], ['Falta', 7],
   ['Observación', 34]];
+// Columnas de la persona en las tablas de los reportes en Excel (como la tabla de marcaciones).
+// ec: con columna Empresa (la plataforma con "Todas las empresas")
+const COLS_PERSONA = ec => [['ID empleado', 12], ['Empleado', 28], ['CI', 12], ...(ec ? [['Empresa', 22]] : []), ['Departamento', 18], ['Cargo', 16]];
+const celdasPersona = (f, ec) => [f.pin, f.nombre || 'No registrado', f.ci, ...(ec ? [f.empresa] : []), f.departamento, f.cargo];
+// Encabezado de las hojas por persona en Excel
+const lineaPersona = h => `ID del empleado: ${h.pin}    Nombres: ${h.nombre || 'No registrado'}    CI: ${h.ci || '—'}    Departamento: ${h.departamento || '—'}` +
+  `    Cargo: ${h.cargo || '—'}    Horario: ${h.horario || 'Sin horario'}${h.horario_propio ? ' (propio)' : h.horario ? ' (de la empresa)' : ''}`;
 function hojaExcel(h, desde, hasta) {
   const t = h.totales;
   return {
     nombre: `${h.pin} ${h.nombre || 'No registrado'}`, horizontal: true, columnas: COLS_HOJA,
-    encabezado: [[`Hoja de asistencia · ${h.empresa}`], [`Fecha inicial ${fechaBO(desde)}    Fecha final ${fechaBO(hasta)}`],
-      [`ID del empleado: ${h.pin}    Nombres: ${h.nombre || 'No registrado'}    CI: ${h.ci || '—'}    Departamento: ${h.departamento || '—'}` +
-        `    Cargo: ${h.cargo || '—'}    Horario: ${h.horario || 'Sin horario'}${h.horario_propio ? ' (propio)' : h.horario ? ' (de la empresa)' : ''}`]],
+    encabezado: [[`Hoja de asistencia · ${h.empresa}`], [`Fecha inicial ${fechaBO(desde)}    Fecha final ${fechaBO(hasta)}`], [lineaPersona(h)]],
     filas: [...h.dias.map(d => [fechaBO(d.dia), diaSem(d.dia), d.horario, d.h_entrada, d.h_salida, d.h_minutos, d.horario ? d.laboral : null,
       d.entrada, d.salida, d.descanso_ini, d.descanso_fin, d.descanso, d.total, d.minutos, d.retraso || null, d.anticipada || null, d.falta || null, d.obs]),
     ['Totales', '', '', '', '', null, t.laborables, '', '', '', '', t.descanso, t.total, t.minutos, t.retraso, t.anticipada, t.faltas,
@@ -1293,13 +1338,14 @@ app.get('/api/reportes/empleados', async (req, res) => {
   const { desde, hasta } = rangoParam(req.query);
   const { hojas, departamentos } = await hojasFiltradas(req, desde, hasta);
   const filas = hojas.map(({ dias, totales, ...p }) => ({ ...p, ...totales }));
-  if (req.query.formato === 'xlsx')
-    return enviarXlsx(res, `reporte_empleados_${desde}_${hasta}`, 'Empleados',
-      [['PIN', 10], ['Empleado', 28], ['CI', 12], ['Empresa', 22], ['Departamento', 16], ['Horario', 16], ['Días laborables', 10],
-        ['Días trabajados', 10], ['Horas trabajadas', 10, 'horas'], ['Retrasos', 9], ['Retraso total', 10, 'horas'],
-        ['Salida anticipada', 10, 'horas'], ['Faltas', 8], ['Días sin salida', 10]],
-      filas.map(f => [f.pin, f.nombre || 'No registrado', f.ci, f.empresa, f.departamento, f.horario, f.laborables, f.dias, f.minutos,
-        f.retrasos, f.retraso, f.anticipada, f.faltas, f.sin_salida]));
+  if (req.query.formato === 'xlsx') {
+    const ec = !empresaScope(req, req.query.empresa_id);
+    return libroConMarcaciones(req, res, `reporte_empleados_${desde}_${hasta}`, [{ nombre: 'Empleados', horizontal: true,
+      columnas: [...COLS_PERSONA(ec), ['Horario', 16], ['Días laborables', 10], ['Días trabajados', 10], ['Horas trabajadas', 10, 'horas'],
+        ['Retrasos', 9], ['Retraso total', 10, 'horas'], ['Salida anticipada', 10, 'horas'], ['Faltas', 8], ['Días sin salida', 10]],
+      filas: filas.map(f => [...celdasPersona(f, ec), f.horario, f.laborables, f.dias, f.minutos,
+        f.retrasos, f.retraso, f.anticipada, f.faltas, f.sin_salida]) }], desde, hasta);
+  }
   res.json({ desde, hasta, filas, departamentos });
 });
 
@@ -1328,7 +1374,8 @@ app.get('/api/reportes/empleado', async (req, res) => {
   if (!persona) throw new HttpError(404, 'El empleado no existe');
   const [js, ctx] = await Promise.all([jornadas(emp, { desde, hasta, suc, empleado_id, pin }), contextoHorarios(emp, desde, hasta)]);
   const [hoja] = armarHojas([persona], js, ctx, desde, hasta);
-  if (req.query.formato === 'xlsx') return enviarLibro(res, `asistencia_${persona.pin}_${desde}_${hasta}`, [hojaExcel(hoja, desde, hasta)]);
+  if (req.query.formato === 'xlsx')
+    return libroConMarcaciones(req, res, `asistencia_${persona.pin}_${desde}_${hasta}`, [hojaExcel(hoja, desde, hasta)], desde, hasta);
   res.json({ desde, hasta, hoja });
 });
 
@@ -1351,10 +1398,10 @@ app.get('/api/reportes/sucursales', async (req, res) => {
   }
   const lista = [...filas.values()].map(f => ({ ...f, asistieron: f.asistieron.size }));
   if (req.query.formato === 'xlsx')
-    return enviarXlsx(res, `reporte_sucursales_${desde}_${hasta}`, 'Sucursales',
-      [['Sucursal', 24], ['Empresa', 24], ['Empleados', 11], ['Asistieron', 11], ['Jornadas', 11], ['Marcaciones', 12],
+    return libroConMarcaciones(req, res, `reporte_sucursales_${desde}_${hasta}`, [{ nombre: 'Sucursales',
+      columnas: [['Sucursal', 24], ['Empresa', 24], ['Empleados', 11], ['Asistieron', 11], ['Jornadas', 11], ['Marcaciones', 12],
         ['Horas', 10, 'horas'], ['Jornadas sin salida', 12]],
-      lista.map(f => [f.sucursal, f.empresa, f.empleados, f.asistieron, f.jornadas, f.marcaciones, f.minutos, f.sin_salida]));
+      filas: lista.map(f => [f.sucursal, f.empresa, f.empleados, f.asistieron, f.jornadas, f.marcaciones, f.minutos, f.sin_salida]) }], desde, hasta);
   res.json({ desde, hasta, filas: lista });
 });
 
@@ -1369,14 +1416,15 @@ app.get('/api/reportes/fecha', async (req, res) => {
     if (f.marcaciones && !f.salida) totales.sin_salida++;
     totales.faltas += f.falta; totales.retrasos += f.retraso ? 1 : 0; totales.minutos += f.minutos || 0;
   }
-  if (req.query.formato === 'xlsx')
-    return enviarXlsx(res, `asistencia_${dia}`, fechaBO(dia).replace(/\//g, '-'),
-      [['PIN', 10], ['Empleado', 28], ['CI', 12], ['Empresa', 22], ['Departamento', 16], ['Sucursal', 18], ['Horario', 14],
-        ['Entrada', 9], ['Descanso', 13], ['Salida', 9], ['Horas trabajadas', 10, 'horas'], ['Retraso', 9, 'horas'],
-        ['Salida anticipada', 10, 'horas'], ['Falta', 7], ['Estado', 34]],
-      lista.map(f => [f.pin, f.nombre || 'No registrado', f.ci, f.empresa, f.departamento, f.sucursal,
+  if (req.query.formato === 'xlsx') {
+    const ec = !empresaScope(req, req.query.empresa_id);
+    return libroConMarcaciones(req, res, `asistencia_${dia}`, [{ nombre: fechaBO(dia).replace(/\//g, '-'), horizontal: true,
+      columnas: [...COLS_PERSONA(ec), ['Sucursal', 18], ['Horario', 14], ['Entrada', 9], ['Descanso', 13], ['Salida', 9],
+        ['Horas trabajadas', 10, 'horas'], ['Retraso', 9, 'horas'], ['Salida anticipada', 10, 'horas'], ['Falta', 7], ['Estado', 34]],
+      filas: lista.map(f => [...celdasPersona(f, ec), f.sucursal,
         f.h_entrada ? `${f.h_entrada}–${f.h_salida}` : f.horario, f.entrada, f.almuerzo, f.salida, f.minutos,
-        f.retraso || null, f.anticipada || null, f.falta || null, ESTADO_DIA[f.estado] + (f.obs ? ` · ${f.obs}` : '')]));
+        f.retraso || null, f.anticipada || null, f.falta || null, ESTADO_DIA[f.estado] + (f.obs ? ` · ${f.obs}` : '')]) }], dia, dia);
+  }
   res.json({ dia, totales, filas: lista });
 });
 
@@ -1386,6 +1434,11 @@ const ESTADO_MARC = { entrada: 'Entrada', salida: 'Salida', descanso_ini: 'Salid
   intermedia: 'Intermedia' };
 const VERIFICACION = { 0: 'Clave', 1: 'Huella', 2: 'Tarjeta', 3: 'Clave', 4: 'Tarjeta', 15: 'Rostro', 25: 'Palma' };
 const MAX_MARC_PANTALLA = 3000; // en pantalla; el Excel las trae todas
+const plural = (n, uno, varios) => `${n} ${n === 1 ? uno : varios}`;
+// Columna "Retraso": minutos de retraso del día, o "Falta" si llegó después del límite
+const celdaRetraso = f => f.falta ? 'Falta' : f.retraso || null;
+const COLS_MARC_PERSONA = [['Fecha', 12, 'fecha'], ['Día', 7], ['Sucursal', 18], ['Dispositivo', 22], ['Hora marcación', 13, 'hora'],
+  ['Estado de marcación', 24], ['Retraso', 10, 'horas'], ['Método de verificación', 15]];
 
 // horas: las de una persona en un día, en orden. La que llega a menos de 2 min de la última que cuenta es repetida
 // y se nombra como esa. Con 3 que cuentan, la del medio no entra en el cálculo: es "intermedia".
@@ -1401,11 +1454,14 @@ function estadosDelDia(horas) {
   return horas.map((_, i) => ({ estado: estado(pos.get(de[i])), repetida: de[i] !== i }));
 }
 
-app.get('/api/reportes/marcaciones', async (req, res) => {
-  const { desde, hasta } = rangoParam(req.query);
+// Marcaciones del filtro, una fila por marcación, ordenadas por persona, fecha y hora. Filtros: empresa, sucursal,
+// equipo, persona (empleado_id, o pin si no está en el panel), nombre/PIN/CI y departamento. Las usan el detalle de
+// marcaciones y la tabla de marcaciones que va debajo de los demás reportes (y su pestaña en el Excel).
+async function marcacionesFiltradas(req, desde, hasta) {
   const emp = empresaScope(req, req.query.empresa_id), suc = numId(req.query.sucursal_id), dev = numId(req.query.dispositivo_id);
   const buscar = clean(req.query.buscar).toLowerCase(), dep = clean(req.query.departamento);
-  const [{ rows }, personas] = await Promise.all([q(`
+  const empId = numId(req.query.empleado_id), pinSuelto = empId ? null : clean(req.query.pin) || null;
+  const [{ rows }, ctx] = await Promise.all([q(`
     SELECT d.empresa_id, x.nombre empresa, e.id empleado_id, COALESCE(e.pin, m.pin) pin, e.nombre, e.ci, e.departamento, e.cargo,
       to_char(m.fecha, 'YYYY-MM-DD') dia, to_char(m.fecha, 'HH24:MI:SS') hora, m.verificacion,
       d.id dispositivo_id, d.nombre dispositivo, d.sucursal_id, s.nombre sucursal
@@ -1417,35 +1473,97 @@ app.get('/api/reportes/marcaciones', async (req, res) => {
       WHERE em.empresa_id=d.empresa_id AND (em.pin=m.pin OR m.pin = ANY(em.pines_anteriores))
       ORDER BY em.pin=m.pin DESC LIMIT 1) e ON TRUE
     WHERE ($1::int IS NULL OR d.empresa_id=$1) AND m.fecha >= $2::date AND m.fecha < $3::date + 1
-    ORDER BY m.fecha, m.id`, [emp, desde, hasta]), esperados(emp, suc)]);
+    ORDER BY m.fecha, m.id`, [emp, desde, hasta]), contextoHorarios(emp, desde, hasta)]);
   // El estado sale de todas las marcaciones de la persona ese día, en cualquier reloj; recién después se filtra
-  const dias = new Map();
+  const dias = new Map(), ahora = ahoraBO();
   for (const r of rows) {
     r.clave = r.empleado_id ? `e${r.empleado_id}` : `p${r.empresa_id}-${r.pin}`;
     const k = `${r.clave}|${r.dia}`;
     if (!dias.has(k)) dias.set(k, []);
     dias.get(k).push(r);
   }
-  for (const lista of dias.values())
-    estadosDelDia(lista.map(r => r.hora)).forEach(({ estado, repetida }, i) => Object.assign(lista[i], {
+  for (const lista of dias.values()) {
+    const horas = lista.map(r => r.hora), { empleado_id, empresa_id, dia } = lista[0];
+    estadosDelDia(horas).forEach(({ estado, repetida }, i) => Object.assign(lista[i], {
       estado, repetida, estado_texto: ESTADO_MARC[estado] + (repetida ? ' (repetida)' : '') }));
+    // El retraso es del día, igual que en las hojas de asistencia: va en la fila de la entrada (la primera)
+    const ev = evaluarDia(dia, calcularJornada(horas), ctx.de(empleado_id, empresa_id, dia), ctx.feriado(empresa_id, dia), ahora, null);
+    Object.assign(lista[0], { retraso: ev.retraso || null, falta: ev.falta, ...(ev.falta ? { obs: ev.obs } : {}) });
+  }
   const incluir = r => (!suc || r.sucursal_id === suc) && (!dev || r.dispositivo_id === dev) && (!dep || r.departamento === dep) &&
+    (!empId || r.empleado_id === empId) && (!pinSuelto || (!r.empleado_id && r.pin === pinSuelto)) &&
     (!buscar || [r.nombre, r.pin, r.ci].some(v => String(v || '').toLowerCase().includes(buscar)));
   const filas = rows.filter(incluir)
     .sort((a, b) => porNombre(a, b) || a.dia.localeCompare(b.dia) || a.hora.localeCompare(b.hora))
     .map(({ verificacion, ...r }) => ({ ...r, metodo: VERIFICACION[verificacion] || (verificacion ? `Código ${verificacion}` : '') }));
-  if (req.query.formato === 'xlsx') {
-    const ec = !emp; // la plataforma con "Todas las empresas"
-    return enviarLibro(res, `marcaciones_${desde}_${hasta}`, [{ nombre: 'Marcaciones', horizontal: true,
-      columnas: [['ID empleado', 12], ['Empleado', 28], ['CI', 12], ...(ec ? [['Empresa', 22]] : []), ['Departamento', 18], ['Cargo', 16],
-        ['Fecha', 12, 'fecha'], ['Día', 7], ['Sucursal', 18], ['Dispositivo', 22], ['Hora marcación', 13, 'hora'],
-        ['Estado de marcación', 24], ['Método de verificación', 15]],
-      filas: filas.map(f => [f.pin, f.nombre || 'No registrado', f.ci, ...(ec ? [f.empresa] : []), f.departamento, f.cargo,
-        f.dia, diaSem(f.dia).slice(0, 3), f.sucursal, f.dispositivo, f.hora, f.estado_texto, f.metodo]) }]);
-  }
+  return { filas, ctx, emp };
+}
+
+// Pestaña "Marcaciones" del Excel. ec: con columna Empresa (la plataforma con "Todas las empresas")
+function hojaMarcaciones(filas, ec) {
+  return { nombre: 'Marcaciones', horizontal: true,
+    columnas: [...COLS_PERSONA(ec), ['Fecha', 12, 'fecha'], ['Día', 7], ['Sucursal', 18], ['Dispositivo', 22], ['Hora marcación', 13, 'hora'],
+      ['Estado de marcación', 24], ['Retraso', 10, 'horas'], ['Método de verificación', 15]],
+    filas: filas.map(f => [...celdasPersona(f, ec), f.dia, diaSem(f.dia).slice(0, 3), f.sucursal, f.dispositivo, f.hora,
+      f.estado_texto, celdaRetraso(f), f.metodo]) };
+}
+// Los reportes con Excel le agregan la pestaña de marcaciones del mismo filtro
+async function libroConMarcaciones(req, res, archivo, hojas, desde, hasta) {
+  const { filas, emp } = await marcacionesFiltradas(req, desde, hasta);
+  return enviarLibro(res, archivo, [...hojas, hojaMarcaciones(filas, !emp)]);
+}
+
+// por_persona=1: una hoja por persona (en Excel, una pestaña cada una) con su total de retraso y sus faltas del período.
+// Salen todas las personas del filtro, también las que no marcaron (para ver sus faltas).
+app.get('/api/reportes/marcaciones', async (req, res) => {
+  const { desde, hasta } = rangoParam(req.query);
+  const porPersona = req.query.por_persona === '1';
+  const [{ filas, ctx, emp }, personas, hojas] = await Promise.all([marcacionesFiltradas(req, desde, hasta),
+    esperados(empresaScope(req, req.query.empresa_id), numId(req.query.sucursal_id)),
+    porPersona ? hojasFiltradas(req, desde, hasta).then(r => r.hojas) : null]);
+  const departamentos = [...new Set(personas.map(p => p.departamento).filter(Boolean))].sort();
+  if (porPersona) return marcacionesPorPersona(req, res, { desde, hasta, filas, hojas, ctx, departamentos });
+  if (req.query.formato === 'xlsx') return enviarLibro(res, `marcaciones_${desde}_${hasta}`, [hojaMarcaciones(filas, !emp)]);
   res.json({ desde, hasta, total: filas.length, personas: new Set(filas.map(f => f.clave)).size,
-    filas: filas.slice(0, MAX_MARC_PANTALLA), departamentos: [...new Set(personas.map(p => p.departamento).filter(Boolean))].sort() });
+    filas: filas.slice(0, MAX_MARC_PANTALLA), departamentos });
 });
+
+// Agrupa las marcaciones por persona. hojas: las de asistencia del mismo filtro, de donde salen el horario y las faltas
+// (incluidas las de días sin marcar). Quien marcó en la sucursal filtrada sin estar asignado a ella va igual, con sus marcaciones.
+function marcacionesPorPersona(req, res, { desde, hasta, filas, hojas, ctx, departamentos }) {
+  const grupos = new Map(hojas.map(({ dias, totales, ...h }) => [h.clave, { ...h, faltas: totales.faltas, filas: [] }]));
+  for (const f of filas) {
+    if (!grupos.has(f.clave)) {
+      const actual = ctx.de(f.empleado_id, f.empresa_id, hasta);
+      grupos.set(f.clave, { clave: f.clave, empleado_id: f.empleado_id, empresa_id: f.empresa_id, empresa: f.empresa, pin: f.pin, nombre: f.nombre,
+        ci: f.ci, departamento: f.departamento, cargo: f.cargo, horario: actual.horario?.nombre || '', horario_propio: actual.origen === 'propio',
+        faltas: 0, filas: [] });
+    }
+    grupos.get(f.clave).filas.push(f);
+  }
+  const lista = [...grupos.values()].sort(porNombre).map(g => ({ ...g, marcaciones: g.filas.length,
+    retraso: g.filas.reduce((a, f) => a + (f.retraso || 0), 0), retrasos: g.filas.filter(f => f.retraso).length }));
+  if (req.query.formato === 'xlsx') {
+    if (!lista.length) throw new HttpError(404, 'No hay personal con esos filtros');
+    return enviarLibro(res, `marcaciones_por_persona_${desde}_${hasta}`, lista.map(g => ({
+      nombre: `${g.pin} ${g.nombre || 'No registrado'}`, horizontal: true, columnas: COLS_MARC_PERSONA,
+      encabezado: [[`Detalle de marcaciones · ${g.empresa}`], [`Fecha inicial ${fechaBO(desde)}    Fecha final ${fechaBO(hasta)}`], [lineaPersona(g)],
+        [`${plural(g.marcaciones, 'marcación', 'marcaciones')}    Retraso total: ${aHoras(g.retraso)} (${plural(g.retrasos, 'retraso', 'retrasos')})` +
+          `    Faltas en el período: ${g.faltas}`]],
+      filas: [...g.filas.map(f => [f.dia, diaSem(f.dia).slice(0, 3), f.sucursal, f.dispositivo, f.hora, f.estado_texto, celdaRetraso(f), f.metodo]),
+        ['Totales', null, null, null, plural(g.marcaciones, 'marcación', 'marcaciones'), plural(g.retrasos, 'retraso', 'retrasos'), g.retraso,
+          plural(g.faltas, 'falta', 'faltas')]],
+    })));
+  }
+  // En pantalla, personas enteras hasta llegar al máximo de filas
+  const enPantalla = [];
+  let n = 0;
+  for (const g of lista) {
+    if (enPantalla.length && n + g.filas.length > MAX_MARC_PANTALLA) break;
+    enPantalla.push(g); n += g.filas.length;
+  }
+  res.json({ desde, hasta, total: filas.length, personas: lista.length, hojas: enPantalla, departamentos });
+}
 
 // ---------------- Horarios y feriados ----------------
 // Los gestionan la plataforma y los usuarios de la empresa con perfil administrador; los de consulta solo los ven.
@@ -1630,8 +1748,10 @@ async function usuarioGestionable(req, id) {
 }
 app.get('/api/usuarios-sistema', async (req, res) => {
   soloEditor(req);
-  const { rows } = await q(`SELECT u.id,u.email,u.nombre,u.rol,u.perfil,u.empresa_id,e.nombre empresa,u.creado
-    FROM usuarios_sistema u LEFT JOIN empresas e ON e.id=u.empresa_id
+  // bloqueado_hasta: solo si está bloqueado ahora por intentos fallidos
+  const { rows } = await q(`SELECT u.id,u.email,u.nombre,u.rol,u.perfil,u.empresa_id,e.nombre empresa,u.creado,
+      CASE WHEN i.bloqueado_hasta > now() THEN i.bloqueado_hasta END bloqueado_hasta
+    FROM usuarios_sistema u LEFT JOIN empresas e ON e.id=u.empresa_id LEFT JOIN intentos_login i ON i.email=lower(u.email)
     WHERE ($1::int IS NULL OR u.empresa_id=$1) ORDER BY u.rol, e.nombre, u.email`, [isAdmin(req) ? null : req.user.empresa_id]);
   res.json(rows);
 });
@@ -1640,17 +1760,25 @@ app.post('/api/usuarios-sistema', async (req, res) => {
   const { email, nombre, password, perfil = 'administrador' } = req.body;
   const rol = isAdmin(req) && req.body.rol === 'admin' ? 'admin' : 'empresa';
   const empresa_id = rol === 'admin' ? null : isAdmin(req) ? req.body.empresa_id : req.user.empresa_id;
-  if (!clean(email) || !password || password.length < 6) throw new HttpError(400, 'Correo y contraseña (mín. 6) obligatorios');
+  if (!clean(email)) throw new HttpError(400, 'Escribe el correo');
+  validarClave(password);
   if (rol === 'empresa' && !empresa_id) throw new HttpError(400, 'Elige la empresa');
   if (!PERFILES.includes(perfil)) throw new HttpError(400, 'Perfil no válido');
   res.json(await one(`INSERT INTO usuarios_sistema (email,nombre,hash,rol,empresa_id,perfil) VALUES ($1,$2,$3,$4,$5,$6) RETURNING id,email`,
     [clean(email).toLowerCase(), clean(nombre), hashPass(password), rol, empresa_id, perfil]));
 });
+// Poner una clave nueva también desbloquea la cuenta
 app.put('/api/usuarios-sistema/:id/password', async (req, res) => {
   soloEditor(req);
   const u = await usuarioGestionable(req, req.params.id);
-  if (!req.body.password || req.body.password.length < 6) throw new HttpError(400, 'Mínimo 6 caracteres');
-  await q(`UPDATE usuarios_sistema SET hash=$2 WHERE id=$1`, [u.id, hashPass(req.body.password)]);
+  await q(`UPDATE usuarios_sistema SET hash=$2 WHERE id=$1`, [u.id, hashPass(validarClave(req.body.password))]);
+  await q(`DELETE FROM intentos_login WHERE email=lower($1)`, [u.email]);
+  res.json({ ok: true });
+});
+app.post('/api/usuarios-sistema/:id/desbloquear', async (req, res) => {
+  soloEditor(req);
+  const u = await usuarioGestionable(req, req.params.id);
+  await q(`DELETE FROM intentos_login WHERE email=lower($1)`, [u.email]);
   res.json({ ok: true });
 });
 app.delete('/api/usuarios-sistema/:id', async (req, res) => {

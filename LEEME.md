@@ -61,8 +61,11 @@ Un acceso de empresa no puede entrar por `/admin` ni el tuyo por `/clientes`. La
    - **Excepciones**: en **Empleados**, marca a quien trabaja distinto y pulsa **Horario propio**. Puedes darle otro horario, dejarlo "sin control de horario" (por ejemplo, gerencia) o devolverlo al de la empresa.
    - En la misma pantalla de Horarios se cargan los **feriados**: los nacionales los cargas tú desde `/admin`, y cada empresa puede agregar los suyos.
 9. **Reportes → Por empleados**: filtra por sucursal, nombre/PIN/CI o departamento. Con un clic en una persona ves su **hoja de asistencia**. "Imprimir hojas" saca una hoja horizontal por cada persona de la lista, y "Hojas en Excel" genera un Excel con una pestaña por persona.
-10. **Reportes → Detalle de marcaciones**: una fila por marcación, ordenada por persona, fecha y hora. Muestra ID, nombre, CI, departamento, cargo, fecha, día, sucursal, equipo, hora, estado (entrada, salida, descanso) y método (rostro, huella, tarjeta o clave). Se imprime en horizontal y se descarga en Excel. El botón "Descargar Excel" de la pantalla **Marcaciones** baja este mismo Excel.
+10. **Por empleados, Por sucursal y Por fecha** muestran sus tablas con el aspecto del Excel (encabezado azul oscuro y celdas con borde). Debajo de cada uno va la **tabla de marcaciones** del mismo filtro, que el Excel trae también como pestaña "Marcaciones". La hoja de asistencia de una persona también lleva sus marcaciones.
+11. **Reportes → Detalle de marcaciones**: una fila por marcación, ordenada por persona, fecha y hora. Muestra ID, nombre, CI, departamento, cargo, fecha, día, sucursal, equipo, hora, estado (entrada, salida, descanso) y método (rostro, huella, tarjeta o clave). Se imprime en horizontal y se descarga en Excel. El botón "Descargar Excel" de la pantalla **Marcaciones** baja este mismo Excel.
     - El reloj no envía si cada marcación es entrada o salida: el panel lo deduce con la misma regla de las horas (ver abajo). Las marcaciones a menos de 2 minutos de la anterior salen como "repetida".
+    - La columna **Retraso** muestra el retraso del día en la fila de la entrada. Si la persona llegó después del límite, dice "Falta".
+    - Con la casilla **Una hoja por persona**, cada persona sale en su hoja: una página horizontal al imprimir y una pestaña en el Excel. Al pie de cada hoja van el total de retraso y las faltas del período. También salen quienes no marcaron, con sus faltas.
 
 **Cómo se calcula con el horario:**
 - **Entrada y salida**: la primera marcación del día es la entrada y la última la salida. Con 4 o más, la 2.ª y la 3.ª son la salida y el regreso del descanso, que se descuenta de las horas. Con 3, la del medio no se usa. Una marcación a menos de 2 minutos de la anterior es repetida y cuenta como una.
@@ -71,6 +74,12 @@ Un acceso de empresa no puede entrar por `/admin` ni el tuyo por `/clientes`. La
 - **Salida anticipada**: los minutos antes de la salida del horario.
 - **Días que no cuentan falta**: los días libres, los feriados, los días sin horario (antes de que la empresa tuviera horario principal) y los días que aún no pasaron.
 - Si editas un horario, cambian también los reportes pasados de quienes lo tienen. Para un cambio a partir de una fecha, crea un horario nuevo y ponlo como principal (o como horario propio) desde esa fecha.
+
+## Seguridad del inicio de sesión
+- **5 contraseñas incorrectas seguidas** bloquean esa cuenta **15 minutos**, en `/admin` y en `/clientes`. El mensaje avisa cuántos intentos quedan.
+- Se libera sola a los 15 minutos. Antes, la liberan "Desbloquear" o "Cambiar clave" en Usuarios (o en Accesos al sistema). Tú desbloqueas a cualquiera; el administrador de una empresa, solo a su gente.
+- Si se bloquea tu propia cuenta de plataforma y no hay otro administrador, espera los 15 minutos.
+- Las claves nuevas deben tener **al menos 8 caracteres, con letras y números**. Las que ya existen siguen sirviendo.
 
 ## Notas
 - **Entrar con clave en el reloj**: los ZKTeco no aceptan solo la clave. En la pantalla principal toca el icono del teclado, escribe el **PIN** del usuario, confirma y luego escribe la **clave**.

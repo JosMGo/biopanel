@@ -60,18 +60,19 @@ VIEWS.usuarios = { title: 'Usuarios', async render() {
   const list = await api('/usuarios-sistema'); // el servidor devuelve solo los de esta empresa
   $('#view').innerHTML = `<div class="card"><div class="card-h"><h2>${list.length} usuarios</h2><button class="btn primary" onclick="formUsuario()">+ Nuevo usuario</button></div>
     <div class="table-wrap"><table><thead><tr><th>Correo</th><th>Nombre</th><th>Perfil</th><th>Creado</th><th></th></tr></thead><tbody>
-    ${list.map(u => `<tr><td><b>${esc(u.email)}</b>${u.id === me.id ? ' <span class="hint">(tú)</span>' : ''}</td><td>${esc(u.nombre)}</td><td>${perfilBadge(u.perfil)}</td>
+    ${list.map(u => `<tr><td><b>${esc(u.email)}</b>${u.id === me.id ? ' <span class="hint">(tú)</span>' : ''}${bloqueoBadge(u)}</td><td>${esc(u.nombre)}</td><td>${perfilBadge(u.perfil)}</td>
       <td>${new Date(u.creado).toLocaleDateString('es-BO')}</td>
-      <td><div class="actions">${u.id !== me.id ? `<button class="btn sm" onclick="resetClave(${u.id})">Cambiar clave</button><button class="btn sm danger" onclick="borrarUsuario(${u.id})">Eliminar</button>` : ''}</div></td></tr>`).join('')}
+      <td><div class="actions">${u.id !== me.id ? `${botonDesbloquear(u)}<button class="btn sm" onclick="resetClave(${u.id})">Cambiar clave</button><button class="btn sm danger" onclick="borrarUsuario(${u.id})">Eliminar</button>` : ''}</div></td></tr>`).join('')}
     </tbody></table></div></div>
-    <p class="hint">Las personas que agregues entran por este mismo link y solo ven ${esc(me.empresa)}. Con perfil "Consulta" ven todo, pero no pueden modificar empleados ni usuarios.</p>`;
+    <p class="hint">Las personas que agregues entran por este mismo link y solo ven ${esc(me.empresa)}. Con perfil "Consulta" ven todo, pero no pueden modificar empleados ni usuarios.
+      Tras 5 contraseñas incorrectas seguidas, la cuenta se bloquea 15 minutos; "Desbloquear" o "Cambiar clave" la liberan antes.</p>`;
 }};
 function formUsuario() {
   modal({ title: 'Nuevo usuario', body: `
     <div class="grid2"><label class="f">Correo<input name="email" type="email" required></label><label class="f">Nombre<input name="nombre"></label></div>
     ${perfilSelect()}
-    <label class="f">Contraseña inicial<input name="password" type="text" minlength="6" required></label>
-    <p class="hint" style="margin:0">Compártela con la persona: puede cambiarla al entrar, en "Cambiar clave".</p>`,
+    <label class="f">Contraseña inicial${claveInput('password')}</label>
+    <p class="hint" style="margin:0">${CLAVE_REGLA}. Compártela con la persona: puede cambiarla al entrar, en "Cambiar clave".</p>`,
     async onSave(f) { await api('/usuarios-sistema', { method: 'POST', body: fd(f) }); toast('Usuario creado'); render(); } });
 }
 

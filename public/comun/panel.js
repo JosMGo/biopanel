@@ -56,12 +56,35 @@ function hace(ts) {
 const tipoBadge = t => t === 'acceso' ? '<span class="badge acc">Control de acceso</span>' : '<span class="badge">Biométrico</span>';
 
 /* ---------- Sesión ---------- */
+// Botón con un ojo para ver u ocultar la contraseña. Devuelve una función que la vuelve a ocultar.
+const OJO = {
+  ver: '<path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/>',
+  ocultar: '<path d="M17.94 17.94A10.07 10.07 0 0 1 12 20c-7 0-11-8-11-8a18.45 18.45 0 0 1 5.06-5.94M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 11 8 11 8a18.5 18.5 0 0 1-2.16 3.19m-6.72-1.07a3 3 0 1 1-4.24-4.24"/><path d="M1 1l22 22"/>',
+};
+function ojoClave(input) {
+  const caja = document.createElement('span'), b = document.createElement('button');
+  caja.className = 'clave-caja'; input.replaceWith(caja); caja.append(input, b);
+  b.type = 'button'; b.className = 'ojo';
+  const pintar = () => {
+    const visible = input.type === 'text';
+    b.innerHTML = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">${visible ? OJO.ocultar : OJO.ver}</svg>`;
+    b.title = visible ? 'Ocultar contraseña' : 'Mostrar contraseña';
+    b.setAttribute('aria-label', b.title); b.setAttribute('aria-pressed', visible);
+  };
+  b.onclick = () => { input.type = input.type === 'password' ? 'text' : 'password'; pintar(); input.focus(); };
+  pintar();
+  return () => { input.type = 'password'; pintar(); };
+}
+const ocultarClaveLogin = ojoClave($('#loginForm [name=password]'));
+
 $('#loginForm').onsubmit = async ev => {
   ev.preventDefault();
   const f = new FormData(ev.target);
   try {
     const r = await api('/login', { method: 'POST', body: { email: f.get('email'), password: f.get('password'), panel: PANEL } });
     $('#loginErr').textContent = '';
+    // La clave no queda escrita (ni a la vista) en el formulario para cuando se cierre la sesión
+    ev.target.password.value = ''; ocultarClaveLogin();
     token = r.token; localStorage.setItem(LS + 'token', token); start();
   } catch (e) { $('#loginErr').textContent = e.message; }
 };
@@ -147,9 +170,20 @@ const perfilBadge = p => { const [c, t] = PERFIL[p] || ['', p]; return `<span cl
 const perfilSelect = () => `<label class="f">Perfil<select name="perfil">
   <option value="administrador">Administrador: gestiona empleados y usuarios de la empresa</option>
   <option value="consulta">Consulta: solo ve (resumen, marcaciones, reportes…)</option></select></label>`;
+// Misma regla que el servidor para las claves nuevas: mínimo 8 caracteres, con letras y números
+const CLAVE_REGLA = 'Mínimo 8 caracteres, con letras y números';
+const claveInput = (name, tipo = 'text', required = true) =>
+  `<input name="${name}" type="${tipo}" minlength="8" maxlength="128" pattern="(?=.*\\p{L})(?=.*\\d).{8,}" title="${CLAVE_REGLA}" ${required ? 'required' : ''} autocomplete="new-password">`;
 function resetClave(id) {
-  modal({ title: 'Cambiar clave', body: '<label class="f">Nueva contraseña<input name="password" type="text" minlength="6" required></label>',
-    async onSave(f) { await api(`/usuarios-sistema/${id}/password`, { method: 'PUT', body: fd(f) }); toast('Clave actualizada'); } });
+  modal({ title: 'Cambiar clave', body: `<label class="f">Nueva contraseña${claveInput('password')}</label><p class="hint" style="margin:0">${CLAVE_REGLA}. Si la cuenta estaba bloqueada por intentos fallidos, también se desbloquea.</p>`,
+    async onSave(f) { await api(`/usuarios-sistema/${id}/password`, { method: 'PUT', body: fd(f) }); toast('Clave actualizada'); render(); } });
+}
+// Cuenta bloqueada por intentos fallidos: se libera sola a los 15 minutos o con el botón Desbloquear
+const bloqueoBadge = u => u.bloqueado_hasta
+  ? ` <span class="badge err" title="Bloqueada por intentos fallidos hasta las ${new Date(u.bloqueado_hasta).toLocaleTimeString('es-BO', { hour: '2-digit', minute: '2-digit' })}">Bloqueada</span>` : '';
+const botonDesbloquear = u => u.bloqueado_hasta ? `<button class="btn sm" onclick="desbloquear(${u.id})">Desbloquear</button>` : '';
+async function desbloquear(id) {
+  await run(() => api(`/usuarios-sistema/${id}/desbloquear`, { method: 'POST' }), 'Cuenta desbloqueada'); render();
 }
 async function borrarUsuario(id) {
   if (!confirmar('¿Eliminar este acceso? La persona deja de poder entrar en ese momento.')) return;
@@ -332,13 +366,18 @@ function exportarMarcaciones() {
 // El servidor arma las jornadas y las compara con el horario de cada persona; aquí solo se muestran
 const hoyISO = () => new Date(Date.now() - new Date().getTimezoneOffset() * 60000).toISOString().slice(0, 10);
 const rep = { desde: hoyISO().slice(0, 8) + '01', hasta: hoyISO(), dia: hoyISO(), sel: null, filas: [], xlsx: null,
-  buscar: '', departamento: '', departamentos: [], hojas: null };
+  buscar: '', departamento: '', departamentos: [], hojas: null, porPersona: false };
 const DIA_SEM = ['Domingo', 'Lunes', 'Martes', 'Miércoles', 'Jueves', 'Viernes', 'Sábado'];
 const diaSem = d => DIA_SEM[new Date(d + 'T00:00:00Z').getUTCDay()];
 const fechaBO = d => d.split('-').reverse().join('/');
 const hm = min => min == null ? '' : `${Math.floor(min / 60)}:${String(min % 60).padStart(2, '0')}`;
 const repEmpCol = () => isAdmin() && !scope().empresa_id;
-const REP_AYUDA = '<p class="hint">Entrada = primera marcación del día; salida = la última. Con 4 o más marcaciones, la 2.ª y la 3.ª se toman como descanso y se descuentan de las horas. Marcaciones repetidas con menos de 2 minutos de diferencia cuentan como una. Retrasos, salidas anticipadas y faltas se calculan con el horario asignado a cada persona (ver "Horarios").</p>';
+const REP_AYUDA = '<p class="hint">El reloj no indica si una marcación es entrada o salida: el panel lo deduce. La primera del día es la entrada y la última la salida; con 4 o más, la 2.ª y la 3.ª son la salida y el regreso del descanso, que se descuenta de las horas; con 3, la del medio no se usa ("Intermedia"). Una marcación a menos de 2 minutos de la anterior es "repetida" y cuenta como una. Retrasos, salidas anticipadas y faltas se calculan con el horario de cada persona (ver "Horarios"): el retraso del día va en la fila de la entrada y, si llegó después del límite, ese día es falta.</p>';
+// Tablas de los reportes con el aspecto del Excel (encabezado azul oscuro, celdas con borde) y la persona en columnas
+const colsPersona = () => repEmpCol() ? 6 : 5;
+const thPersona = () => `<th>ID empleado</th><th>Empleado</th><th>CI</th>${repEmpCol() ? '<th>Empresa</th>' : ''}<th>Departamento</th><th>Cargo</th>`;
+const tdPersona = f => `<td class="num">${esc(f.pin)}</td><td>${f.nombre ? `<b>${esc(f.nombre)}</b>` : '<span class="hint">No registrado</span>'}</td>
+  <td>${esc(f.ci)}</td>${repEmpCol() ? `<td>${esc(f.empresa)}</td>` : ''}<td>${esc(f.departamento)}</td><td>${esc(f.cargo)}</td>`;
 const ESTADO_REP = { presente: ['ok', 'Presente'], retraso: ['warn', 'Retraso'], anticipada: ['warn', 'Salida anticipada'],
   sin_salida: ['warn', 'Sin salida'], falta: ['err', 'Falta'], libre: ['', 'Libre'], feriado: ['acc', 'Feriado'],
   sin_horario: ['', 'Sin horario'], pendiente: ['', 'Pendiente'], antes_alta: ['', 'Antes del ingreso'] };
@@ -346,15 +385,15 @@ const estadoBadge = e => { const [c, t] = ESTADO_REP[e] || ['', e]; return `<spa
 
 function repBarra(campos, volver = '') {
   return `<div class="toolbar rep-bar no-print">${volver}${campos}<span class="grow"></span>
-    <button class="btn" onclick="window.print()">Imprimir / PDF</button>
-    <button class="btn primary" onclick="repDescargar(rep.xlsx)">Descargar Excel</button></div>`;
+    <div class="rep-acciones"><button class="btn" onclick="window.print()">Imprimir / PDF</button>
+    <button class="btn primary" onclick="repDescargar(rep.xlsx)">Descargar Excel</button></div></div>`;
 }
 const repRango = () => `<label class="f">Desde<input type="date" value="${rep.desde}" onchange="if (this.value) { rep.desde = this.value; render(); }"></label>
   <label class="f">Hasta<input type="date" value="${rep.hasta}" onchange="if (this.value) { rep.hasta = this.value; render(); }"></label>`;
 // Personal filtrado: nombre / PIN / CI y departamento (la sucursal se elige arriba)
 const repDepOpciones = () => '<option value="">Todos</option>' +
   rep.departamentos.map(d => `<option value="${esc(d)}" ${d === rep.departamento ? 'selected' : ''}>${esc(d)}</option>`).join('');
-const repFiltros = () => `<label class="f">Buscar<input value="${esc(rep.buscar)}" placeholder="Nombre, PIN o CI" onchange="rep.buscar = this.value.trim(); render()"></label>
+const repFiltros = () => `<label class="f">Buscar<input style="width:150px" value="${esc(rep.buscar)}" placeholder="Nombre, PIN o CI" onchange="rep.buscar = this.value.trim(); render()"></label>
   <label class="f">Departamento<select id="repDep" onchange="rep.departamento = this.value; render()">${repDepOpciones()}</select></label>`;
 const repRangoTexto = () => rep.desde === rep.hasta ? fechaBO(rep.desde) : `Del ${fechaBO(rep.desde)} al ${fechaBO(rep.hasta)}`;
 function repLugar(empresa) {
@@ -387,41 +426,38 @@ async function repDescargar(x) {
 
 // titulo ya viene escapado. clic: cada fila abre la hoja de la persona y se ofrecen las hojas de todos los listados
 function repTablaEmpleados(titulo, filas, clic) {
-  const ec = repEmpCol(), t = { dias: 0, minutos: 0, retrasos: 0, retraso: 0, anticipada: 0, faltas: 0, sin_salida: 0 };
+  const t = { dias: 0, minutos: 0, retrasos: 0, retraso: 0, anticipada: 0, faltas: 0, sin_salida: 0 };
   filas.forEach(f => { for (const k in t) t[k] += f[k]; });
   return `<div class="card"><div class="card-h"><h2>${titulo}</h2>${clic && filas.length ? `<span class="hint no-print">Clic en una persona: su hoja de asistencia</span>
       <button class="btn sm no-print" onclick="imprimirHojas()" title="Una hoja horizontal por cada persona de la lista">Imprimir hojas (${filas.length})</button>
       <button class="btn sm no-print" onclick="repDescargar(rep.hojas)" title="Un Excel con una pestaña por persona de la lista">Hojas en Excel</button>` : ''}</div>
-    <div class="table-wrap"><table>
-    <thead><tr><th class="num">PIN</th><th>Empleado</th>${ec ? '<th>Empresa</th>' : ''}<th>Horario</th>
-      <th class="num" title="Días trabajados / días laborables según su horario">Días</th><th class="num">Horas</th><th class="num">Retrasos</th>
-      <th class="num">Salida anticip.</th><th class="num">Faltas</th><th class="num">Sin salida</th></tr></thead><tbody>
-    ${filas.map((f, i) => `<tr${clic ? ` class="clic" onclick="rep.sel = rep.filas[${i}]; render()"` : ''}>
-      <td class="num"><b>${esc(f.pin)}</b></td>
-      <td>${f.nombre ? `<b>${esc(f.nombre)}</b>` : '<span class="hint">No registrado en el panel</span>'}<div class="sub">${esc([f.ci && 'CI ' + f.ci, f.departamento].filter(Boolean).join(' · '))}</div></td>
-      ${ec ? `<td>${esc(f.empresa)}</td>` : ''}
+    <div class="table-wrap"><table class="grilla rep">
+    <thead><tr>${thPersona()}<th>Horario</th><th title="Días trabajados / días laborables según su horario">Días</th><th>Horas</th><th>Retrasos</th>
+      <th>Salida anticip.</th><th>Faltas</th><th>Sin salida</th></tr></thead><tbody>
+    ${filas.map((f, i) => `<tr${clic ? ` class="clic" onclick="rep.sel = rep.filas[${i}]; render()"` : ''}>${tdPersona(f)}
       <td>${f.horario ? esc(f.horario) : '<span class="hint">Sin horario</span>'}${f.horario_propio ? ' <span class="badge">propio</span>' : ''}</td>
       <td class="num">${f.dias}${f.laborables ? `<span class="hint"> / ${f.laborables}</span>` : ''}</td><td class="num">${f.dias ? hm(f.minutos) : ''}</td>
-      <td class="num">${f.retrasos ? `<b class="t-warn">${hm(f.retraso)}</b><div class="sub">${f.retrasos} ${f.retrasos === 1 ? 'vez' : 'veces'}</div>` : ''}</td>
+      <td class="num">${f.retrasos ? `<b class="t-warn">${hm(f.retraso)}</b> <span class="hint">(${f.retrasos} ${f.retrasos === 1 ? 'vez' : 'veces'})</span>` : ''}</td>
       <td class="num">${f.anticipada ? hm(f.anticipada) : ''}</td>
       <td class="num">${f.faltas ? `<span class="badge err">${f.faltas}</span>` : ''}</td>
       <td class="num">${f.sin_salida ? `<span class="badge warn">${f.sin_salida}</span>` : ''}</td></tr>`).join('')
-      || '<tr><td colspan="10" class="empty">Sin empleados con esos filtros</td></tr>'}
-    </tbody>${filas.length ? `<tfoot><tr><td colspan="${ec ? 4 : 3}">Total · ${filas.length} empleados</td><td class="num">${t.dias}</td>
+      || `<tr><td colspan="${colsPersona() + 7}" class="empty">Sin empleados con esos filtros</td></tr>`}
+    </tbody>${filas.length ? `<tfoot><tr><td colspan="${colsPersona() + 1}">Total · ${filas.length} empleados</td><td class="num">${t.dias}</td>
       <td class="num">${hm(t.minutos)}</td><td class="num">${t.retrasos ? hm(t.retraso) : ''}</td><td class="num">${t.anticipada ? hm(t.anticipada) : ''}</td>
       <td class="num">${t.faltas || ''}</td><td class="num">${t.sin_salida || ''}</td></tr></tfoot>` : ''}
     </table></div></div>`;
 }
 
+// Datos de la persona en el encabezado de las hojas
+const personaHtml = h => `<div>ID del empleado: <b>${esc(h.pin)}</b> · Nombres: <b>${esc(h.nombre || 'No registrado en el panel')}</b> · CI: <b>${esc(h.ci || '—')}</b>
+  · Departamento: <b>${esc(h.departamento || '—')}</b>${h.cargo ? ` · Cargo: <b>${esc(h.cargo)}</b>` : ''} · Horario: <b>${esc(h.horario || 'Sin horario')}</b>${h.horario
+    ? (h.horario_propio ? ' (propio)' : ' (de la empresa)') : ''}</div>`;
 // Hoja de asistencia de una persona: en pantalla, impresa (una página horizontal por persona) y en el Excel
 function hojaHtml(h, desde, hasta) {
   const t = h.totales, v = x => x || '';
   return `<div class="hoja card">
     <div class="hoja-cab"><h2>Hoja de asistencia</h2>
-      <div>${esc(h.empresa)} · Fecha inicial <b>${fechaBO(desde)}</b> · Fecha final <b>${fechaBO(hasta)}</b></div>
-      <div>ID del empleado: <b>${esc(h.pin)}</b> · Nombres: <b>${esc(h.nombre || 'No registrado en el panel')}</b> · CI: <b>${esc(h.ci || '—')}</b>
-        · Departamento: <b>${esc(h.departamento || '—')}</b>${h.cargo ? ` · Cargo: <b>${esc(h.cargo)}</b>` : ''} · Horario: <b>${esc(h.horario || 'Sin horario')}</b>${h.horario
-          ? (h.horario_propio ? ' (propio)' : ' (de la empresa)') : ''}</div></div>
+      <div>${esc(h.empresa)} · Fecha inicial <b>${fechaBO(desde)}</b> · Fecha final <b>${fechaBO(hasta)}</b></div>${personaHtml(h)}</div>
     <div class="table-wrap"><table class="grilla">
       <thead><tr><th rowspan="2">Fecha</th><th rowspan="2">Día</th><th colspan="5">Horario</th><th colspan="7">Marcado</th><th colspan="4">Resultado</th></tr>
         <tr><th>Nombre</th><th>Entrada</th><th>Salida</th><th>Horas laborales</th><th>Día laboral</th>
@@ -459,13 +495,14 @@ VIEWS['rep-empleados'] = { title: 'Reporte por empleados', render() {
   if (rep.sel) return repEmpleado();
   const p = { ...scope(), desde: rep.desde, hasta: rep.hasta, buscar: rep.buscar, departamento: rep.departamento };
   return repVista(repBarra(repRango() + repFiltros()), async () => {
-    const r = await api('/reportes/empleados' + qs(p));
+    const [r, m] = await Promise.all([api('/reportes/empleados' + qs(p)), api('/reportes/marcaciones' + qs(p))]);
     return { filas: r.filas, xlsx: { path: '/reportes/empleados', p, nombre: `reporte_empleados_${p.desde}_${p.hasta}.xlsx` },
       alMostrar() {
         rep.hojas = { path: '/reportes/hojas', p, nombre: `hojas_asistencia_${p.desde}_${p.hasta}.xlsx` };
         rep.departamentos = r.departamentos; if ($('#repDep')) $('#repDep').innerHTML = repDepOpciones();
       },
-      html: repCabecera('Reporte por empleados', repRangoTexto()) + repTablaEmpleados(`${r.filas.length} empleados`, r.filas, true) + REP_AYUDA };
+      html: `<div class="apaisado">${repCabecera('Reporte por empleados', repRangoTexto())}${repTablaEmpleados(`${r.filas.length} empleados`, r.filas, true)}
+        ${tablaMarcaciones(m, 'Marcaciones')}${REP_AYUDA}</div>` };
   });
 }};
 
@@ -473,8 +510,10 @@ function repEmpleado() {
   const f = rep.sel;
   const p = { ...scope(), empresa_id: f.empresa_id, desde: rep.desde, hasta: rep.hasta, ...(f.empleado_id ? { empleado_id: f.empleado_id } : { pin: f.pin }) };
   return repVista(repBarra(repRango(), '<button class="btn" onclick="rep.sel = null; render()">← Todos los empleados</button>'), async () => {
-    const r = await api('/reportes/empleado' + qs(p));
-    return { xlsx: { path: '/reportes/empleado', p, nombre: `asistencia_${r.hoja.pin}_${p.desde}_${p.hasta}.xlsx` }, html: hojaHtml(r.hoja, r.desde, r.hasta) };
+    const [r, m] = await Promise.all([api('/reportes/empleado' + qs(p)), api('/reportes/marcaciones' + qs(p))]);
+    // Al imprimir, la hoja va en una página y sus marcaciones en la siguiente
+    return { xlsx: { path: '/reportes/empleado', p, nombre: `asistencia_${r.hoja.pin}_${p.desde}_${p.hasta}.xlsx` },
+      html: `<div class="apaisado">${hojaHtml(r.hoja, r.desde, r.hasta)}${tablaMarcaciones(m, 'Marcaciones')}</div>` };
   });
 }
 
@@ -483,27 +522,30 @@ VIEWS['rep-sucursales'] = { title: 'Reporte por sucursal', render() {
   if (rep.sel) {
     const s = rep.sel, pd = { ...p, empresa_id: s.empresa_id, sucursal_id: s.sucursal_id };
     return repVista(repBarra(repRango(), '<button class="btn" onclick="rep.sel = null; render()">← Todas las sucursales</button>'), async () => {
-      const r = await api('/reportes/empleados' + qs(pd));
+      const [r, m] = await Promise.all([api('/reportes/empleados' + qs(pd)), api('/reportes/marcaciones' + qs(pd))]);
       return { xlsx: { path: '/reportes/empleados', p: pd, nombre: `reporte_${s.sucursal.replace(/[^\w-]+/g, '_')}_${p.desde}_${p.hasta}.xlsx` },
-        html: repCabecera(`Reporte de la sucursal ${s.sucursal}`, repRangoTexto(), `${s.empresa} · ${s.sucursal}`)
-          + repTablaEmpleados(`${esc(s.sucursal)} · ${r.filas.length} empleados`, r.filas, false) + REP_AYUDA };
+        html: `<div class="apaisado">${repCabecera(`Reporte de la sucursal ${s.sucursal}`, repRangoTexto(), `${s.empresa} · ${s.sucursal}`)}
+          ${repTablaEmpleados(`${esc(s.sucursal)} · ${r.filas.length} empleados`, r.filas, false)}
+          ${tablaMarcaciones(m, `Marcaciones en ${esc(s.sucursal)}`)}${REP_AYUDA}</div>` };
     });
   }
   return repVista(repBarra(repRango()), async () => {
-    const r = await api('/reportes/sucursales' + qs(p)), ec = repEmpCol();
+    const [r, m] = await Promise.all([api('/reportes/sucursales' + qs(p)), api('/reportes/marcaciones' + qs(p))]), ec = repEmpCol();
     const t = { jornadas: 0, marcaciones: 0, minutos: 0, sin_salida: 0 };
     r.filas.forEach(f => { for (const k in t) t[k] += f[k]; });
     return { filas: r.filas, xlsx: { path: '/reportes/sucursales', p, nombre: `reporte_sucursales_${p.desde}_${p.hasta}.xlsx` },
-      html: repCabecera('Reporte por sucursal', repRangoTexto()) + `<div class="card">
+      html: `<div class="apaisado">${repCabecera('Reporte por sucursal', repRangoTexto())}<div class="card">
         <div class="card-h"><h2>${r.filas.length} sucursales</h2>${r.filas.length ? '<span class="hint no-print">Haz clic en una sucursal para ver a sus empleados</span>' : ''}</div>
-        <div class="table-wrap"><table><thead><tr><th>Sucursal</th>${ec ? '<th>Empresa</th>' : ''}<th class="num">Empleados</th><th class="num">Asistieron</th>
-          <th class="num" title="Suma de los días trabajados por todos los empleados">Jornadas</th><th class="num">Marcaciones</th><th class="num">Horas</th><th class="num">Sin salida</th></tr></thead><tbody>
+        <div class="table-wrap"><table class="grilla rep"><thead><tr><th>Sucursal</th>${ec ? '<th>Empresa</th>' : ''}<th>Empleados</th><th>Asistieron</th>
+          <th title="Suma de los días trabajados por todos los empleados">Jornadas</th>
+          <th title="Las de las jornadas que empezaron en esta sucursal (la tabla de abajo muestra lo marcado en sus relojes)">Marcaciones</th><th>Horas</th><th>Sin salida</th></tr></thead><tbody>
         ${r.filas.map((f, i) => `<tr class="clic" onclick="rep.sel = rep.filas[${i}]; render()"><td><b>${esc(f.sucursal)}</b></td>${ec ? `<td>${esc(f.empresa)}</td>` : ''}
           <td class="num">${f.empleados}</td><td class="num">${f.asistieron}</td><td class="num">${f.jornadas}</td><td class="num">${f.marcaciones}</td>
           <td class="num">${hm(f.minutos)}</td><td class="num">${f.sin_salida ? `<span class="badge warn">${f.sin_salida}</span>` : ''}</td></tr>`).join('')
-          || '<tr><td colspan="8" class="empty">Sin sucursales</td></tr>'}
+          || `<tr><td colspan="${ec ? 8 : 7}" class="empty">Sin sucursales</td></tr>`}
         </tbody>${r.filas.length > 1 ? `<tfoot><tr><td colspan="${ec ? 4 : 3}">Total</td><td class="num">${t.jornadas}</td><td class="num">${t.marcaciones}</td>
-          <td class="num">${hm(t.minutos)}</td><td class="num">${t.sin_salida || ''}</td></tr></tfoot>` : ''}</table></div></div>` + REP_AYUDA };
+          <td class="num">${hm(t.minutos)}</td><td class="num">${t.sin_salida || ''}</td></tr></tfoot>` : ''}</table></div></div>
+        ${tablaMarcaciones(m, 'Marcaciones')}${REP_AYUDA}</div>` };
   });
 }};
 
@@ -513,27 +555,26 @@ VIEWS['rep-fecha'] = { title: 'Reporte por fecha', render() {
     <label class="f">Día<input type="date" value="${rep.dia}" onchange="if (this.value) { rep.dia = this.value; render(); }"></label>
     <button class="btn" onclick="repMoverDia(1)" title="Día siguiente">›</button>`;
   return repVista(repBarra(campos), async () => {
-    const r = await api('/reportes/fecha' + qs(p)), t = r.totales, ec = repEmpCol();
-    const fecha = `${diaSem(r.dia)} ${fechaBO(r.dia)}`, conDetalle = ['falta', 'retraso', 'anticipada', 'feriado'];
+    const [r, m] = await Promise.all([api('/reportes/fecha' + qs(p)), api('/reportes/marcaciones' + qs({ ...scope(), desde: rep.dia, hasta: rep.dia }))]);
+    const t = r.totales, fecha = `${diaSem(r.dia)} ${fechaBO(r.dia)}`, conDetalle = ['falta', 'retraso', 'anticipada', 'feriado'];
     return { xlsx: { path: '/reportes/fecha', p, nombre: `asistencia_${r.dia}.xlsx` },
-      html: repCabecera('Asistencia del día', fecha) + `<div class="tiles">
+      html: `<div class="apaisado">${repCabecera('Asistencia del día', fecha)}<div class="tiles">
         <div class="card tile"><div class="k">Presentes</div><div class="v">${t.presentes}<small> / ${r.filas.length}</small></div></div>
         <div class="card tile"><div class="k">Faltas</div><div class="v">${t.faltas}</div></div>
         <div class="card tile"><div class="k">Retrasos</div><div class="v">${t.retrasos}</div></div>
         <div class="card tile"><div class="k">Sin salida</div><div class="v">${t.sin_salida}</div></div>
         <div class="card tile"><div class="k">Horas trabajadas</div><div class="v">${hm(t.minutos)}</div></div></div>
-        <div class="card"><div class="card-h"><h2>${esc(fecha)}</h2></div><div class="table-wrap"><table>
-        <thead><tr><th class="num">PIN</th><th>Empleado</th>${ec ? '<th>Empresa</th>' : ''}<th>Sucursal</th><th>Horario</th><th>Entrada</th><th>Descanso</th>
-          <th>Salida</th><th class="num">Horas</th><th class="num">Retraso</th><th>Estado</th></tr></thead><tbody>
-        ${r.filas.map(f => `<tr><td class="num"><b>${esc(f.pin)}</b></td>
-          <td>${f.nombre ? `<b>${esc(f.nombre)}</b>` : '<span class="hint">No registrado en el panel</span>'}<div class="sub">${esc([f.ci && 'CI ' + f.ci, f.departamento].filter(Boolean).join(' · '))}</div></td>
-          ${ec ? `<td>${esc(f.empresa)}</td>` : ''}<td>${esc(f.sucursal)}</td>
+        <div class="card"><div class="card-h"><h2>${esc(fecha)}</h2></div><div class="table-wrap"><table class="grilla rep">
+        <thead><tr>${thPersona()}<th>Sucursal</th><th>Horario</th><th>Entrada</th><th>Descanso</th>
+          <th>Salida</th><th>Horas</th><th>Retraso</th><th>Estado</th></tr></thead><tbody>
+        ${r.filas.map(f => `<tr>${tdPersona(f)}<td>${esc(f.sucursal)}</td>
           <td class="num">${f.h_entrada ? `${f.h_entrada}–${f.h_salida}` : f.horario ? '<span class="hint">Libre</span>' : '<span class="hint">Sin horario</span>'}</td>
           <td class="num">${f.entrada || ''}</td><td class="num">${f.almuerzo || ''}</td><td class="num">${f.salida || ''}</td><td class="num">${hm(f.minutos)}</td>
           <td class="num">${f.retraso ? `<b class="t-warn">${hm(f.retraso)}</b>` : ''}</td>
-          <td>${estadoBadge(f.estado)}${conDetalle.includes(f.estado) && f.obs ? `<div class="sub">${esc(f.obs)}</div>` : ''}</td></tr>`).join('')
-          || '<tr><td colspan="11" class="empty">Sin empleados ni marcaciones este día</td></tr>'}
-        </tbody></table></div></div>` + REP_AYUDA };
+          <td class="obs">${estadoBadge(f.estado)}${conDetalle.includes(f.estado) && f.obs ? ` <span class="hint">${esc(f.obs)}</span>` : ''}</td></tr>`).join('')
+          || `<tr><td colspan="${colsPersona() + 8}" class="empty">Sin empleados ni marcaciones este día</td></tr>`}
+        </tbody></table></div></div>
+        ${tablaMarcaciones(m, `Marcaciones del ${esc(fecha)}`)}${REP_AYUDA}</div>` };
   });
 }};
 function repMoverDia(n) {
@@ -541,31 +582,60 @@ function repMoverDia(n) {
   rep.dia = d.toISOString().slice(0, 10); render();
 }
 
-// Una fila por marcación, como el Excel. Se imprime en horizontal.
+// Una fila por marcación, como el Excel. Se imprime en horizontal. Con la casilla "Una hoja por persona",
+// cada persona va en su hoja (una página impresa, una pestaña en Excel) con su total de retraso y sus faltas.
 const MARC_COLOR = { entrada: 'ok', salida: 'acc', descanso_ini: '', descanso_fin: '' };
-const MARC_AYUDA = '<p class="hint">El reloj no indica si una marcación es entrada o salida: el panel lo deduce con la misma regla de los reportes. La primera del día es la entrada y la última la salida; con 4 o más, la 2.ª y la 3.ª son la salida y el regreso del descanso. Con 3, la del medio no se usa ("Intermedia"). Una marcación a menos de 2 minutos de la anterior es "repetida" y no cuenta.</p>';
+const marcEstado = f => f.repetida || f.estado === 'intermedia' ? `<span class="hint">${esc(f.estado_texto)}</span>`
+  : `<span class="badge ${MARC_COLOR[f.estado]}">${esc(f.estado_texto)}</span>`;
+const marcRetraso = f => f.falta ? `<span class="badge err" title="${esc(f.obs)}">Falta</span>` : f.retraso ? `<b class="t-warn">${hm(f.retraso)}</b>` : '';
+const cuentaMarc = r => `${r.total} ${r.total === 1 ? 'marcación' : 'marcaciones'} · ${r.personas} ${r.personas === 1 ? 'persona' : 'personas'}`;
+
+// Tabla de marcaciones del filtro (r: respuesta de /reportes/marcaciones): el detalle de marcaciones y, con
+// título, la que va debajo de los demás reportes
+function tablaMarcaciones(r, titulo = '') {
+  // Una línea más marcada donde empieza otra persona
+  const filas = r.filas.map((f, i) => `<tr class="${i && f.clave !== r.filas[i - 1].clave ? 'corte' : ''}">${tdPersona(f)}
+    <td class="num">${fechaBO(f.dia)}</td><td>${diaSem(f.dia).slice(0, 3)}</td><td>${esc(f.sucursal)}</td><td>${esc(f.dispositivo)}</td>
+    <td class="num"><b>${f.hora}</b></td><td>${marcEstado(f)}</td><td class="num">${marcRetraso(f)}</td><td>${esc(f.metodo)}</td></tr>`).join('');
+  const corte = r.total > r.filas.length ? `<span class="hint">Se muestran las primeras ${r.filas.length}; el Excel trae las ${r.total}</span>` : '';
+  return `<div class="card rep-marc"><div class="card-h">${titulo ? `<h2>${titulo}</h2><span class="hint">${cuentaMarc(r)}</span>` : `<h2>${cuentaMarc(r)}</h2>`}${corte}</div>
+    <div class="table-wrap"><table class="grilla rep"><thead><tr>${thPersona()}<th>Fecha</th><th>Día</th><th>Sucursal</th><th>Dispositivo</th>
+      <th>Hora marcación</th><th>Estado de marcación</th><th>Retraso</th><th>Método de verificación</th></tr></thead>
+    <tbody>${filas || `<tr><td colspan="${colsPersona() + 8}" class="empty">Sin marcaciones con esos filtros</td></tr>`}</tbody></table></div></div>`;
+}
+const marcCasilla = () => `<label class="casilla" title="Cada persona en su hoja: una página al imprimir y una pestaña en el Excel">
+  <input type="checkbox" ${rep.porPersona ? 'checked' : ''} onchange="rep.porPersona = this.checked; render()"> Una hoja por persona</label>`;
+
+function marcHojaHtml(g, desde, hasta) {
+  return `<div class="hoja card">
+    <div class="hoja-cab"><h2>Detalle de marcaciones</h2>
+      <div>${esc(g.empresa)} · Fecha inicial <b>${fechaBO(desde)}</b> · Fecha final <b>${fechaBO(hasta)}</b></div>${personaHtml(g)}</div>
+    <div class="table-wrap"><table class="grilla rep"><thead><tr><th>Fecha</th><th>Día</th><th>Sucursal</th><th>Dispositivo</th>
+      <th>Hora marcación</th><th>Estado de marcación</th><th>Retraso</th><th>Método de verificación</th></tr></thead>
+    <tbody>${g.filas.map(f => `<tr><td class="num">${fechaBO(f.dia)}</td><td>${diaSem(f.dia).slice(0, 3)}</td><td>${esc(f.sucursal)}</td>
+      <td>${esc(f.dispositivo)}</td><td class="num"><b>${f.hora}</b></td><td>${marcEstado(f)}</td><td class="num">${marcRetraso(f)}</td>
+      <td>${esc(f.metodo)}</td></tr>`).join('') || '<tr><td colspan="8" class="empty">Sin marcaciones en el período</td></tr>'}</tbody>
+    <tfoot><tr><td colspan="4">Totales</td><td class="num">${g.marcaciones} ${g.marcaciones === 1 ? 'marcación' : 'marcaciones'}</td>
+      <td>${g.retrasos} ${g.retrasos === 1 ? 'retraso' : 'retrasos'}</td><td class="num">${hm(g.retraso)}</td>
+      <td class="${g.faltas ? 't-err' : ''}">Faltas en el período: ${g.faltas}</td></tr></tfoot></table></div></div>`;
+}
+
 VIEWS['rep-marcaciones'] = { title: 'Detalle de marcaciones', render() {
-  const p = { ...scope(), desde: rep.desde, hasta: rep.hasta, buscar: rep.buscar, departamento: rep.departamento };
-  return repVista(repBarra(repRango() + repFiltros()), async () => {
-    const r = await api('/reportes/marcaciones' + qs(p)), ec = repEmpCol();
-    const estado = f => f.repetida || f.estado === 'intermedia' ? `<span class="hint">${esc(f.estado_texto)}</span>`
-      : `<span class="badge ${MARC_COLOR[f.estado]}">${esc(f.estado_texto)}</span>`;
-    // Una línea más marcada donde empieza otra persona
-    const filas = r.filas.map((f, i) => `<tr class="${i && f.clave !== r.filas[i - 1].clave ? 'corte' : ''}">
-      <td class="num">${esc(f.pin)}</td><td>${f.nombre ? `<b>${esc(f.nombre)}</b>` : '<span class="hint">No registrado</span>'}</td>
-      <td>${esc(f.ci)}</td>${ec ? `<td>${esc(f.empresa)}</td>` : ''}<td>${esc(f.departamento)}</td><td>${esc(f.cargo)}</td>
-      <td class="num">${fechaBO(f.dia)}</td><td>${diaSem(f.dia).slice(0, 3)}</td><td>${esc(f.sucursal)}</td><td>${esc(f.dispositivo)}</td>
-      <td class="num"><b>${f.hora}</b></td><td>${estado(f)}</td><td>${esc(f.metodo)}</td></tr>`).join('');
-    const corte = r.total > r.filas.length
-      ? `<span class="hint">Se muestran las primeras ${r.filas.length}; el Excel trae las ${r.total}</span>` : '';
-    return { xlsx: { path: '/reportes/marcaciones', p, nombre: `marcaciones_${p.desde}_${p.hasta}.xlsx` },
-      alMostrar() { rep.departamentos = r.departamentos; if ($('#repDep')) $('#repDep').innerHTML = repDepOpciones(); },
-      html: `<div class="apaisado">${repCabecera('Detalle de marcaciones', repRangoTexto())}<div class="card">
-        <div class="card-h"><h2>${r.total} ${r.total === 1 ? 'marcación' : 'marcaciones'} · ${r.personas} ${r.personas === 1 ? 'persona' : 'personas'}</h2>${corte}</div>
-        <div class="table-wrap"><table class="grilla marc"><thead><tr><th>ID empleado</th><th>Empleado</th><th>CI</th>${ec ? '<th>Empresa</th>' : ''}
-          <th>Departamento</th><th>Cargo</th><th>Fecha</th><th>Día</th><th>Sucursal</th><th>Dispositivo</th><th>Hora marcación</th>
-          <th>Estado de marcación</th><th>Método de verificación</th></tr></thead>
-        <tbody>${filas || `<tr><td colspan="${ec ? 13 : 12}" class="empty">Sin marcaciones con esos filtros</td></tr>`}</tbody></table></div></div>${MARC_AYUDA}</div>` };
+  const p = { ...scope(), desde: rep.desde, hasta: rep.hasta, buscar: rep.buscar, departamento: rep.departamento, por_persona: rep.porPersona ? 1 : '' };
+  const xlsx = { path: '/reportes/marcaciones', p, nombre: `marcaciones${rep.porPersona ? '_por_persona' : ''}_${p.desde}_${p.hasta}.xlsx` };
+  const alMostrar = r => () => { rep.departamentos = r.departamentos; if ($('#repDep')) $('#repDep').innerHTML = repDepOpciones(); };
+  return repVista(repBarra(repRango() + repFiltros() + marcCasilla()), async () => {
+    const r = await api('/reportes/marcaciones' + qs(p));
+    if (rep.porPersona) {
+      const corte = r.hojas.length < r.personas ? ` · <span class="t-warn">se muestran ${r.hojas.length}; el Excel trae a todas</span>` : '';
+      return { xlsx, alMostrar: alMostrar(r),
+        html: `<p class="hint no-print">${r.personas} ${r.personas === 1 ? 'persona' : 'personas'} · ${r.total} ${r.total === 1 ? 'marcación' : 'marcaciones'}${corte}.
+          Al imprimir, cada persona sale en una hoja horizontal.</p>
+          <div>${r.hojas.map(g => marcHojaHtml(g, r.desde, r.hasta)).join('') || '<div class="card empty">No hay personal con esos filtros</div>'}</div>
+          <div class="no-print">${REP_AYUDA}</div>` };
+    }
+    return { xlsx, alMostrar: alMostrar(r),
+      html: `<div class="apaisado">${repCabecera('Detalle de marcaciones', repRangoTexto())}${tablaMarcaciones(r)}${REP_AYUDA}</div>` };
   });
 }};
 
@@ -731,6 +801,7 @@ async function asignarHorario() {
 const marcarTodos = c => document.querySelectorAll('#empTable input[name=empSel]').forEach(x => { x.checked = c.checked; });
 
 function cambiarClave() {
-  modal({ title: 'Cambiar mi clave', body: `<label class="f">Clave actual<input name="actual" type="password" required></label><label class="f">Nueva clave<input name="nueva" type="password" minlength="6" required></label>`,
+  modal({ title: 'Cambiar mi clave', body: `<label class="f">Clave actual<input name="actual" type="password" required autocomplete="current-password"></label>
+    <label class="f">Nueva clave${claveInput('nueva', 'password')}</label><p class="hint" style="margin:0">${CLAVE_REGLA}.</p>`,
     async onSave(f) { await api('/me/password', { method: 'POST', body: fd(f) }); toast('Clave actualizada'); } });
 }

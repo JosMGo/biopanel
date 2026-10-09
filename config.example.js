@@ -6,8 +6,8 @@ module.exports = {
   TIMEZONE: -4,                 // Bolivia (UTC-4)
 
   // Administrador inicial (se crea solo la primera vez). Cambia la clave después de entrar.
-  ADMIN_EMAIL: '',
-  ADMIN_PASSWORD: '',
+  ADMIN_EMAIL: 'malvarez@sirtsc.com',
+  ADMIN_PASSWORD: 'Martin0411.',
 
   // Segundos sin contacto para considerar un equipo "fuera de línea"
   ONLINE_SECONDS: 60,

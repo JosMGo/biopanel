@@ -72,11 +72,14 @@ function formEmpresa(id) {
     <label class="f">Nombre<input name="nombre" required value="${esc(e.nombre)}"></label>
     <label class="f">NIT<input name="nit" value="${esc(e.nit)}"></label>
     ${id ? '' : `<p class="hint" style="margin:4px 0 0">Se crea automáticamente la sucursal "Principal". Opcional: acceso para la empresa.</p>
-    <div class="grid2"><label class="f">Correo de acceso<input name="email" type="email"></label><label class="f">Contraseña<input name="password" type="text" minlength="6"></label></div>`}`,
+    <div class="grid2"><label class="f">Correo de acceso<input name="email" type="email"></label><label class="f">Contraseña${claveInput('password', 'text', false)}</label></div>
+    <p class="hint" style="margin:0">Contraseña: ${CLAVE_REGLA.toLowerCase()}.</p>`}`,
     async onSave(f) {
       const d = fd(f);
       if (id) await api('/empresas/' + id, { method: 'PUT', body: d });
       else {
+        // Se revisa antes de crear la empresa, para no dejarla creada sin su acceso
+        if (d.email && !d.password) throw new Error('Pon la contraseña del acceso o deja vacío el correo');
         const nueva = await api('/empresas', { method: 'POST', body: d });
         if (d.email) await api('/usuarios-sistema', { method: 'POST', body: { email: d.email, password: d.password, nombre: d.nombre, rol: 'empresa', empresa_id: nueva.id } });
       }
@@ -234,17 +237,18 @@ VIEWS.usuarios = { title: 'Accesos al sistema', async render() {
   const list = await api('/usuarios-sistema');
   $('#view').innerHTML = `<div class="card"><div class="card-h"><h2>${list.length} accesos</h2><button class="btn primary" onclick="formUsuario()">+ Nuevo acceso</button></div>
     <div class="table-wrap"><table><thead><tr><th>Correo</th><th>Nombre</th><th>Rol / perfil</th><th>Empresa</th><th></th></tr></thead><tbody>
-    ${list.map(u => `<tr><td><b>${esc(u.email)}</b></td><td>${esc(u.nombre)}</td><td>${u.rol === 'admin' ? '<span class="badge acc">Administrador de la plataforma</span>' : `<span class="badge">Empresa</span> ${perfilBadge(u.perfil)}`}</td><td>${esc(u.empresa || '—')}</td>
-      <td><div class="actions"><button class="btn sm" onclick="resetClave(${u.id})">Cambiar clave</button>${u.id !== me.id ? `<button class="btn sm danger" onclick="borrarUsuario(${u.id})">Eliminar</button>` : ''}</div></td></tr>`).join('')}
+    ${list.map(u => `<tr><td><b>${esc(u.email)}</b>${bloqueoBadge(u)}</td><td>${esc(u.nombre)}</td><td>${u.rol === 'admin' ? '<span class="badge acc">Administrador de la plataforma</span>' : `<span class="badge">Empresa</span> ${perfilBadge(u.perfil)}`}</td><td>${esc(u.empresa || '—')}</td>
+      <td><div class="actions">${botonDesbloquear(u)}<button class="btn sm" onclick="resetClave(${u.id})">Cambiar clave</button>${u.id !== me.id ? `<button class="btn sm danger" onclick="borrarUsuario(${u.id})">Eliminar</button>` : ''}</div></td></tr>`).join('')}
     </tbody></table></div></div>
-    <p class="hint">Los accesos de empresa entran por <b>/clientes</b> y solo ven su empresa. Con perfil "Administrador" gestionan sus empleados y sus propios usuarios; con "Consulta" solo ven.</p>`;
+    <p class="hint">Los accesos de empresa entran por <b>/clientes</b> y solo ven su empresa. Con perfil "Administrador" gestionan sus empleados y sus propios usuarios; con "Consulta" solo ven.
+      Tras 5 contraseñas incorrectas seguidas, la cuenta se bloquea 15 minutos; "Desbloquear" o "Cambiar clave" la liberan antes.</p>`;
 }};
 function formUsuario() {
   const form = modal({ title: 'Nuevo acceso', body: `
     <div class="grid2"><label class="f">Correo<input name="email" type="email" required></label><label class="f">Nombre<input name="nombre"></label></div>
     <label class="f">Rol<select name="rol"><option value="empresa">Empresa (entra por /clientes y solo ve su empresa)</option><option value="admin">Administrador de la plataforma (entra por /admin)</option></select></label>
     <div id="uEmp" style="display:flex;flex-direction:column;gap:12px">${empresaSelect('empresa_id', scope().empresa_id)}${perfilSelect()}</div>
-    <label class="f">Contraseña<input name="password" type="text" minlength="6" required></label>`,
+    <label class="f">Contraseña${claveInput('password')}</label><p class="hint" style="margin:0">${CLAVE_REGLA}.</p>`,
     async onSave(f) { await api('/usuarios-sistema', { method: 'POST', body: fd(f) }); toast('Acceso creado'); render(); } });
   const rol = form.querySelector('[name=rol]'), emp = form.querySelector('[name=empresa_id]');
   rol.onchange = () => { const a = rol.value === 'admin'; form.querySelector('#uEmp').classList.toggle('hidden', a); emp.required = !a; };
